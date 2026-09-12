@@ -1,1 +1,4 @@
 *~
+.devcontainer/.env.auth
+*.env
+.env.*
