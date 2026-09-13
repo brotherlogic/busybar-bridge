@@ -4,9 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -404,4 +411,286 @@ func TestBackoffReset_After30SecondsUptime(t *testing.T) {
 		t.Errorf("expected backoff delay after 35s stable uptime to reset to 1s, got %v", delays[2])
 	}
 }
+
+func parseServerHostPort(t *testing.T, s *httptest.Server) (string, int) {
+	t.Helper()
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatalf("failed to parse server URL %q: %v", s.URL, err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("failed to parse port from %q: %v", u.Host, err)
+	}
+	return u.Hostname(), port
+}
+
+func TestWebSocketActivationHandshake(t *testing.T) {
+	activationReceived := make(chan string, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/status/ws" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Errorf("failed to accept websocket: %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		typ, payload, err := conn.Read(r.Context())
+		if err != nil {
+			t.Errorf("failed to read activation frame: %v", err)
+			return
+		}
+		if typ != websocket.MessageText {
+			t.Errorf("expected MessageText, got %v", typ)
+		}
+		activationReceived <- string(payload)
+
+		// Hold connection until context cancelled or closed
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   100 * time.Millisecond,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	defer client.Close()
+
+	select {
+	case msg := <-activationReceived:
+		expectedMsg := `{"enable": true}`
+		if msg != expectedMsg {
+			t.Errorf("expected activation frame %q, got %q", expectedMsg, msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for stream activation frame")
+	}
+
+	// Verify telemetry state updated
+	var connected bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		status := client.Status()
+		if status.Connected && !status.LastConnectedAt.IsZero() {
+			connected = true
+			break
+		}
+	}
+	if !connected {
+		t.Errorf("expected client status Connected=true and non-zero LastConnectedAt")
+	}
+}
+
+func TestWebSocketKeepalivePing(t *testing.T) {
+	var pingCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+			OnPingReceived: func(ctx context.Context, payload []byte) bool {
+				pingCount.Add(1)
+				return true
+			},
+		})
+		if err != nil {
+			t.Errorf("accept error: %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		// Read activation frame
+		_, _, err = conn.Read(r.Context())
+		if err != nil {
+			return
+		}
+
+		// Keep connection open and read
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   30 * time.Millisecond,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	defer client.Close()
+
+	// Wait for multiple keepalive ping dispatches
+	start := time.Now()
+	for time.Since(start) < 2*time.Second {
+		if pingCount.Load() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if count := pingCount.Load(); count < 2 {
+		t.Errorf("expected at least 2 ping frames dispatched, got %d", count)
+	}
+}
+
+func TestWebSocketGracefulShutdown(t *testing.T) {
+	closeStatusCode := make(chan websocket.StatusCode, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		// Read activation message
+		if _, _, err := conn.Read(r.Context()); err != nil {
+			return
+		}
+
+		// Read until closure
+		for {
+			_, _, err := conn.Read(r.Context())
+			if err != nil {
+				code := websocket.CloseStatus(err)
+				closeStatusCode <- code
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   50 * time.Millisecond,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+	})
+
+	ctx := context.Background()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	// Wait until client reports connected
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		if client.IsConnected() {
+			break
+		}
+	}
+	if !client.IsConnected() {
+		t.Fatal("client never reached connected state")
+	}
+
+	// Close client gracefully
+	if err := client.Close(); err != nil {
+		t.Fatalf("client.Close() failed: %v", err)
+	}
+
+	// Verify server received StatusNormalClosure
+	select {
+	case code := <-closeStatusCode:
+		if code != websocket.StatusNormalClosure {
+			t.Errorf("expected close code StatusNormalClosure (%d), got %v", websocket.StatusNormalClosure, code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for normal close handshake on server")
+	}
+
+	// Verify status after shutdown
+	if client.IsConnected() {
+		t.Errorf("expected client.IsConnected() == false after Close()")
+	}
+}
+
+func TestWebSocketActivationFailure_ClosesAndRetries(t *testing.T) {
+	var connCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := connCount.Add(1)
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		if count == 1 {
+			// First attempt: immediately abort so client activation write fails or connection drops
+			conn.Close(websocket.StatusInternalError, "simulated handshake error")
+			return
+		}
+		// Subsequent attempts: accept and read normally
+		defer conn.Close(websocket.StatusInternalError, "closed")
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   100 * time.Millisecond,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     30 * time.Millisecond,
+	})
+
+	ctx := context.Background()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	defer client.Close()
+
+	// Wait until client retried and reconnected
+	start := time.Now()
+	for time.Since(start) < 3*time.Second {
+		if connCount.Load() >= 2 && client.IsConnected() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if connCount.Load() < 2 {
+		t.Errorf("expected client to reconnect after handshake failure, connection attempts: %d", connCount.Load())
+	}
+}
+
 
