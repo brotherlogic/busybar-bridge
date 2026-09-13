@@ -215,7 +215,8 @@ func (c *Client) worker(ctx context.Context) {
 }
 
 // dispatch processes a single event: evaluates TTL staleness, constructs the HTTP POST request,
-// dispatches it to Home Assistant, and records the outcome and latency in the telemetry store.
+// dispatches it to Home Assistant with a two-tier retry policy (transient retries up to MaxRetries
+// and zero-retry permanent failure on 4xx), and records the outcome and latency in the telemetry store.
 func (c *Client) dispatch(ctx context.Context, event Event) {
 	// Pre-dispatch TTL staleness evaluation
 	createdAt := event.CreatedAt
@@ -255,35 +256,100 @@ func (c *Client) dispatch(ctx context.Context, event Event) {
 		return
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, postURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		if c.store != nil {
-			c.store.RecordForwardOutcome(traceID, telemetry.OutcomeFailure, 0, err)
-		}
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
-	req.Header.Set("Content-Type", "application/json")
-
+	var lastErr error
+	var finalLatency time.Duration
 	start := time.Now()
-	resp, err := c.httpClient.Do(req)
-	latency := time.Since(start)
 
-	var outcome telemetry.ForwardingOutcome
-	if err != nil {
-		outcome = telemetry.OutcomeFailure
-	} else {
+	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Re-check TTL before each retry attempt
+			remainingTTL := c.cfg.TTL - time.Since(createdAt)
+			if remainingTTL <= 0 {
+				if c.store != nil {
+					c.store.RecordDrop("ttl_expired")
+				}
+				return
+			}
+
+			// Backoff interval: cfg.RetryBackoff * attempt
+			backoff := c.cfg.RetryBackoff * time.Duration(attempt)
+			waitDuration := backoff
+			if waitDuration > remainingTTL {
+				waitDuration = remainingTTL
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(waitDuration):
+			}
+
+			// Re-check TTL after backoff interval
+			if time.Since(createdAt) > c.cfg.TTL {
+				if c.store != nil {
+					c.store.RecordDrop("ttl_expired")
+				}
+				return
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, postURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			lastErr = safeError(err, c.cfg.Token)
+			break
+		}
+		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		finalLatency = time.Since(start)
+
+		if err != nil {
+			// Network timeouts or connection failures: transient error
+			lastErr = safeError(err, c.cfg.Token)
+			continue
+		}
+
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			outcome = telemetry.OutcomeSuccess
-		} else {
-			outcome = telemetry.OutcomeFailure
-			err = fmt.Errorf("http error: %s", resp.Status)
+
+		statusCode := resp.StatusCode
+		if statusCode >= 200 && statusCode < 300 {
+			// HTTP 200 OK: record success and latency in telemetry store
+			if c.store != nil {
+				c.store.RecordForwardOutcome(traceID, telemetry.OutcomeSuccess, finalLatency, nil)
+			}
+			return
 		}
+
+		if statusCode >= 400 && statusCode < 500 {
+			// HTTP 4xx client errors: classify as permanent failure, discard immediately with zero retries,
+			// and ensure auth tokens are never logged.
+			permErr := fmt.Errorf("permanent error: HTTP %d %s", statusCode, http.StatusText(statusCode))
+			if c.store != nil {
+				c.store.RecordForwardOutcome(traceID, telemetry.OutcomeFailure, finalLatency, safeError(permErr, c.cfg.Token))
+			}
+			return
+		}
+
+		// HTTP 5xx server errors: transient error, continue retry loop up to cfg.MaxRetries
+		lastErr = fmt.Errorf("transient server error: HTTP %d %s", statusCode, http.StatusText(statusCode))
 	}
 
+	// Exhausted retries without success
 	if c.store != nil {
-		c.store.RecordForwardOutcome(traceID, outcome, latency, err)
+		c.store.RecordForwardOutcome(traceID, telemetry.OutcomeFailure, finalLatency, safeError(lastErr, c.cfg.Token))
 	}
+}
+
+// safeError ensures that sensitive bearer tokens are redacted from error messages.
+func safeError(err error, token string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if token != "" && strings.Contains(msg, token) {
+		msg = strings.ReplaceAll(msg, token, "[REDACTED]")
+	}
+	return errors.New(msg)
 }

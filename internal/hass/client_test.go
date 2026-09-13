@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -469,3 +470,298 @@ func TestTTLExpirationDrop(t *testing.T) {
 		t.Fatalf("expected 1 dropped event in telemetry store, got %d", store.DropCount())
 	}
 }
+
+func TestTransientRetrySuccess(t *testing.T) {
+	var requestCount atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := requestCount.Add(1)
+		if count == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = "test-token"
+	cfg.MaxRetries = 2
+	cfg.RetryBackoff = 20 * time.Millisecond
+	cfg.TTL = 2 * time.Second
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	ev := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, time.Now().Unix())
+	if ok := client.Enqueue(ev); !ok {
+		t.Fatalf("expected Enqueue to succeed")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if store.Snapshot().Forwarding.TotalAcked == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	if got := requestCount.Load(); got != 2 {
+		t.Fatalf("expected 2 requests (1 initial + 1 retry), got %d", got)
+	}
+
+	snap := store.Snapshot()
+	if snap.Forwarding.TotalAcked != 1 {
+		t.Fatalf("expected 1 TotalAcked in telemetry store, got %d", snap.Forwarding.TotalAcked)
+	}
+	if snap.Forwarding.TotalFailed != 0 {
+		t.Fatalf("expected 0 TotalFailed in telemetry store, got %d", snap.Forwarding.TotalFailed)
+	}
+	if len(snap.RecentEvents) > 0 {
+		if snap.RecentEvents[0].Outcome != telemetry.OutcomeSuccess {
+			t.Fatalf("expected OutcomeSuccess, got %v", snap.RecentEvents[0].Outcome)
+		}
+	}
+}
+
+func TestTransientRetryTTLAbort(t *testing.T) {
+	var requestCount atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = "test-token"
+	cfg.MaxRetries = 5
+	cfg.RetryBackoff = 80 * time.Millisecond
+	cfg.TTL = 120 * time.Millisecond
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	ev := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, time.Now().Unix())
+	if ok := client.Enqueue(ev); !ok {
+		t.Fatalf("expected Enqueue to succeed")
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if store.DropCount() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	if got := requestCount.Load(); got > 2 {
+		t.Fatalf("expected retry loop to abort before max retries, got %d requests", got)
+	}
+
+	if store.DropCount() != 1 {
+		t.Fatalf("expected 1 TTL drop recorded in telemetry store, got %d", store.DropCount())
+	}
+}
+
+func TestPermanentErrorNoRetry_401(t *testing.T) {
+	var requestCount atomic.Int64
+	const secretToken = "super-secret-token-sensitive-401"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = secretToken
+	cfg.MaxRetries = 3
+	cfg.RetryBackoff = 20 * time.Millisecond
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	ev := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, time.Now().Unix())
+	if ok := client.Enqueue(ev); !ok {
+		t.Fatalf("expected Enqueue to succeed")
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if store.Snapshot().Forwarding.TotalFailed > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	if got := requestCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 request (zero retries on 401), got %d", got)
+	}
+
+	snap := store.Snapshot()
+	if snap.Forwarding.TotalFailed != 1 {
+		t.Fatalf("expected 1 TotalFailed, got %d", snap.Forwarding.TotalFailed)
+	}
+	if snap.Forwarding.TotalAcked != 0 {
+		t.Fatalf("expected 0 TotalAcked, got %d", snap.Forwarding.TotalAcked)
+	}
+
+	for _, tr := range snap.RecentEvents {
+		if strings.Contains(tr.Error, secretToken) {
+			t.Fatalf("auth token leaked in telemetry error: %s", tr.Error)
+		}
+	}
+}
+
+func TestPermanentErrorNoRetry_400(t *testing.T) {
+	var requestCount atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = "test-token"
+	cfg.MaxRetries = 3
+	cfg.RetryBackoff = 20 * time.Millisecond
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	ev := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, time.Now().Unix())
+	if ok := client.Enqueue(ev); !ok {
+		t.Fatalf("expected Enqueue to succeed")
+	}
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if store.Snapshot().Forwarding.TotalFailed > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	if got := requestCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 request (zero retries on 400), got %d", got)
+	}
+
+	snap := store.Snapshot()
+	if snap.Forwarding.TotalFailed != 1 {
+		t.Fatalf("expected 1 TotalFailed, got %d", snap.Forwarding.TotalFailed)
+	}
+}
+
+func TestConcurrentSafety(t *testing.T) {
+	cfg := hass.DefaultConfig()
+	cfg.Token = "test-token"
+	cfg.BufferSize = 100
+	cfg.MaxRetries = 2
+	cfg.RetryBackoff = 5 * time.Millisecond
+	cfg.TTL = 500 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	cfg.BaseURL = server.URL
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const numGoroutines = 8
+	const eventsPerGoroutine = 50
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for j := 0; j < eventsPerGoroutine; j++ {
+				ev := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, int64(gid*1000+j))
+				client.Enqueue(ev)
+				time.Sleep(1 * time.Millisecond)
+			}
+		}(i)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	wg.Wait()
+}
+
