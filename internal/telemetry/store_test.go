@@ -309,3 +309,19 @@ func TestRecordForwardOutcomeEvictedTrace(t *testing.T) {
 		t.Errorf("expected TotalAcked=1, got %d", snap.Forwarding.TotalAcked)
 	}
 }
+
+func TestRecordDrop(t *testing.T) {
+	store := telemetry.NewStore()
+
+	if store.DropCount() != 0 {
+		t.Fatalf("expected initial DropCount=0, got %d", store.DropCount())
+	}
+
+	store.RecordDrop("buffer_overflow")
+	store.RecordDrop("event-123", "ttl_expired")
+
+	if store.DropCount() != 2 {
+		t.Fatalf("expected DropCount=2, got %d", store.DropCount())
+	}
+}
+

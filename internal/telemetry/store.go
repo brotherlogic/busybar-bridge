@@ -71,6 +71,7 @@ type Store struct {
 	nextID          int64
 	totalEvents     int64
 	maxRingCapacity int
+	dropCount       int64
 }
 
 // NewStore initializes a Store with current start time and a 10-event capacity ring buffer.
@@ -191,4 +192,18 @@ func (s *Store) Snapshot() Snapshot {
 		TotalEvents:  s.totalEvents,
 		RecentEvents: recent,
 	}
+}
+
+// RecordDrop records an event drop reason in the telemetry store.
+func (s *Store) RecordDrop(reason ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropCount++
+}
+
+// DropCount returns the total number of dropped events.
+func (s *Store) DropCount() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dropCount
 }
