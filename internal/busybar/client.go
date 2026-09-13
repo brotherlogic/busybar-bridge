@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -49,6 +51,8 @@ type Client struct {
 	stableThreshold time.Duration
 	backoffDelay    time.Duration
 	activeConn      *websocket.Conn
+	overflowCount   atomic.Int64
+	closeOnce       sync.Once
 }
 
 // DefaultConfig returns sensible production defaults for the Busy Bar client.
@@ -126,6 +130,11 @@ func (c *Client) Config() Config {
 // Frames returns a receive-only channel for ingested binary frames.
 func (c *Client) Frames() <-chan []byte {
 	return c.framesChan
+}
+
+// OverflowCount returns the number of dropped frames due to a full buffer.
+func (c *Client) OverflowCount() int64 {
+	return c.overflowCount.Load()
 }
 
 // Status returns a point-in-time copy of the connection status.
@@ -206,6 +215,9 @@ func (c *Client) Start(ctx context.Context) error {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		defer c.closeOnce.Do(func() {
+			close(c.framesChan)
+		})
 		c.run(runCtx)
 	}()
 
@@ -226,6 +238,9 @@ func (c *Client) Close() error {
 		_ = conn.Close(websocket.StatusNormalClosure, "shutting down")
 	}
 	c.wg.Wait()
+	c.closeOnce.Do(func() {
+		close(c.framesChan)
+	})
 	return nil
 }
 
@@ -423,9 +438,23 @@ func (c *Client) connectAndSupervise(ctx context.Context) error {
 
 func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
-		_, _, err := conn.Read(ctx)
+		typ, payload, err := conn.Read(ctx)
 		if err != nil {
 			return err
+		}
+
+		switch typ {
+		case websocket.MessageBinary:
+			select {
+			case c.framesChan <- payload:
+			default:
+				c.overflowCount.Add(1)
+				log.Printf("warning: frames channel buffer full, dropping binary frame (%d bytes)", len(payload))
+			}
+		case websocket.MessageText:
+			log.Printf("warning: unexpected text frame received, discarding: %s", string(payload))
+		default:
+			log.Printf("warning: unexpected frame type %v received, discarding", typ)
 		}
 	}
 }

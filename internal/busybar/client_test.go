@@ -693,4 +693,291 @@ func TestWebSocketActivationFailure_ClosesAndRetries(t *testing.T) {
 	}
 }
 
+func TestWebSocketBinaryFrameForwarding(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			t.Errorf("failed to accept websocket: %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		// Read activation handshake
+		_, _, err = conn.Read(r.Context())
+		if err != nil {
+			return
+		}
+
+		// Send binary frames
+		testFrames := [][]byte{
+			{0x01, 0x02, 0x03},
+			{0x10, 0x20, 0x30, 0x40},
+			{0xFF, 0xEE},
+		}
+		for _, frame := range testFrames {
+			if err := conn.Write(r.Context(), websocket.MessageBinary, frame); err != nil {
+				return
+			}
+		}
+
+		// Keep connection open until closed
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   1 * time.Second,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+		BufferSize:     10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	defer client.Close()
+
+	expectedFrames := [][]byte{
+		{0x01, 0x02, 0x03},
+		{0x10, 0x20, 0x30, 0x40},
+		{0xFF, 0xEE},
+	}
+
+	for i, expected := range expectedFrames {
+		select {
+		case frame, ok := <-client.Frames():
+			if !ok {
+				t.Fatalf("frame channel closed unexpectedly at index %d", i)
+			}
+			if string(frame) != string(expected) {
+				t.Errorf("frame %d: expected %v, got %v", i, expected, frame)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for binary frame %d", i)
+		}
+	}
+}
+
+func TestWebSocketSlowConsumer_NonBlocking(t *testing.T) {
+	sendComplete := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		// Read activation handshake
+		_, _, err = conn.Read(r.Context())
+		if err != nil {
+			return
+		}
+
+		// BufferSize is 2. Send 6 frames without the client consuming them.
+		for i := 0; i < 6; i++ {
+			if err := conn.Write(r.Context(), websocket.MessageBinary, []byte{byte(i)}); err != nil {
+				return
+			}
+		}
+		close(sendComplete)
+
+		// Keep connection open until closed
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   1 * time.Second,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+		BufferSize:     2,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	defer client.Close()
+
+	// Wait for server to finish sending all 6 frames
+	select {
+	case <-sendComplete:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server to send frames")
+	}
+
+	// Wait for client to process and drop overflow frames
+	var overflow int64
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		overflow = client.OverflowCount()
+		if overflow > 0 {
+			break
+		}
+	}
+
+	if overflow == 0 {
+		t.Errorf("expected overflow count > 0, got 0")
+	}
+
+	// Verify buffer still holds exactly BufferSize (2) frames
+	for i := 0; i < 2; i++ {
+		select {
+		case <-client.Frames():
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("expected buffered frame %d", i)
+		}
+	}
+}
+
+func TestWebSocketUnexpectedTextFrames_Discarded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		// Read activation handshake
+		_, _, err = conn.Read(r.Context())
+		if err != nil {
+			return
+		}
+
+		// Send unexpected text frames
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"status": "diagnostic"}`))
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`plain text warning`))
+
+		// Follow with a binary frame
+		_ = conn.Write(r.Context(), websocket.MessageBinary, []byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+		// Keep connection open until closed
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   1 * time.Second,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+		BufferSize:     10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	defer client.Close()
+
+	// Only the binary frame should be delivered to Frames()
+	select {
+	case frame := <-client.Frames():
+		expected := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+		if string(frame) != string(expected) {
+			t.Errorf("expected frame %v, got %v", expected, frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for binary frame after text frames")
+	}
+
+	// Connection must remain alive
+	if !client.IsConnected() {
+		t.Errorf("expected client to remain connected after discarding text frames")
+	}
+}
+
+func TestWebSocketGracefulShutdown_ClosesFramesChannel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusInternalError, "closed")
+
+		// Read activation handshake
+		_, _, err = conn.Read(r.Context())
+		if err != nil {
+			return
+		}
+
+		for {
+			if _, _, err := conn.Read(r.Context()); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	host, port := parseServerHostPort(t, server)
+	client := NewClient(Config{
+		Host:           host,
+		Port:           port,
+		PingInterval:   1 * time.Second,
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+	})
+
+	ctx := context.Background()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	// Wait for connected
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(10 * time.Millisecond) {
+		if client.IsConnected() {
+			break
+		}
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("client.Close() failed: %v", err)
+	}
+
+	// Verify Frames channel is closed
+	select {
+	case _, ok := <-client.Frames():
+		if ok {
+			t.Errorf("expected Frames() channel to be closed, but received value")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for Frames() channel closure")
+	}
+}
+
+
 
