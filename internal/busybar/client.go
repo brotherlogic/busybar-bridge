@@ -2,9 +2,13 @@ package busybar
 
 import (
 	"context"
+	"errors"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
+
+const defaultStableConnectionThreshold = 30 * time.Second
 
 // Config encapsulates connection, backoff, and buffering parameters for the Busy Bar client.
 type Config struct {
@@ -28,12 +32,16 @@ type ConnectionStatus struct {
 
 // Client manages the lifecycle, ingestion, and status accessors for a Busy Bar device stream.
 type Client struct {
-	cfg        Config
-	status     ConnectionStatus
-	mu         sync.RWMutex
-	framesChan chan []byte
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	cfg             Config
+	status          ConnectionStatus
+	mu              sync.RWMutex
+	framesChan      chan []byte
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	connectFn       func(ctx context.Context) error
+	sleepFn         func(ctx context.Context, d time.Duration) error
+	stableThreshold time.Duration
+	backoffDelay    time.Duration
 }
 
 // DefaultConfig returns sensible production defaults for the Busy Bar client.
@@ -47,6 +55,18 @@ func DefaultConfig() Config {
 		MaxBackoff:        60 * time.Second,
 		BackoffMultiplier: 1.5,
 		BufferSize:        100,
+	}
+}
+
+// defaultSleep waits for the duration or context cancellation.
+func defaultSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -78,10 +98,15 @@ func NewClient(cfg Config) *Client {
 		cfg.BufferSize = defaults.BufferSize
 	}
 
-	return &Client{
-		cfg:        cfg,
-		framesChan: make(chan []byte, cfg.BufferSize),
+	c := &Client{
+		cfg:             cfg,
+		framesChan:      make(chan []byte, cfg.BufferSize),
+		stableThreshold: defaultStableConnectionThreshold,
+		backoffDelay:    cfg.InitialBackoff,
 	}
+	c.connectFn = c.connectAndSupervise
+	c.sleepFn = defaultSleep
+	return c
 }
 
 // Config returns a copy of the client configuration.
@@ -115,4 +140,154 @@ func (c *Client) setStatus(status ConnectionStatus) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.status = status
+}
+
+// CurrentBackoff returns the current backoff delay before jitter.
+func (c *Client) CurrentBackoff() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.backoffDelay
+}
+
+// CalculateBackoff computes exponential backoff with full jitter:
+// sleep = rand.Float64() * min(maxBackoff, currentBackoff).
+func CalculateBackoff(currentBackoff, maxBackoff time.Duration) time.Duration {
+	effective := currentBackoff
+	if maxBackoff > 0 && effective > maxBackoff {
+		effective = maxBackoff
+	}
+	if effective <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Float64() * float64(effective))
+}
+
+// CalculateBackoff calculates full jitter sleep duration using the client's configured MaxBackoff.
+func (c *Client) CalculateBackoff(currentBackoff time.Duration) time.Duration {
+	c.mu.RLock()
+	maxBackoff := c.cfg.MaxBackoff
+	c.mu.RUnlock()
+	return CalculateBackoff(currentBackoff, maxBackoff)
+}
+
+// nextBackoff computes the next exponential backoff delay capped at MaxBackoff.
+func (c *Client) nextBackoff(currentBackoff time.Duration) time.Duration {
+	c.mu.RLock()
+	multiplier := c.cfg.BackoffMultiplier
+	maxBackoff := c.cfg.MaxBackoff
+	c.mu.RUnlock()
+
+	next := time.Duration(float64(currentBackoff) * multiplier)
+	if next > maxBackoff {
+		return maxBackoff
+	}
+	return next
+}
+
+// Start starts the background reconnection loop governed by the provided context.
+func (c *Client) Start(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cancel != nil {
+		return errors.New("client already started")
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.run(runCtx)
+	}()
+
+	return nil
+}
+
+// Close gracefully stops the client and waits for all background goroutines to finish.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	cancel := c.cancel
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	c.wg.Wait()
+	return nil
+}
+
+// run is the background reconnection loop with exponential backoff and full jitter.
+func (c *Client) run(ctx context.Context) {
+	c.mu.RLock()
+	currentBackoff := c.cfg.InitialBackoff
+	c.mu.RUnlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		connectStart := time.Now()
+
+		// Attempt connection & supervision
+		connectErr := c.connectFn(ctx)
+
+		disconnectTime := time.Now()
+
+		c.mu.Lock()
+		wasConnected := c.status.Connected
+		lastConnectedAt := c.status.LastConnectedAt
+		c.status.Connected = false
+		c.status.LastDisconnectedAt = disconnectTime
+		c.status.ReconnectCount++
+		threshold := c.stableThreshold
+		c.mu.Unlock()
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		if threshold <= 0 {
+			threshold = defaultStableConnectionThreshold
+		}
+
+		// Backoff reset logic: reset to InitialBackoff only after the connection
+		// has remained stably connected for at least 30 seconds.
+		uptime := time.Duration(0)
+		if wasConnected && !lastConnectedAt.IsZero() {
+			uptime = disconnectTime.Sub(lastConnectedAt)
+		} else if connectErr == nil {
+			uptime = disconnectTime.Sub(connectStart)
+		}
+
+		c.mu.RLock()
+		initialBackoff := c.cfg.InitialBackoff
+		c.mu.RUnlock()
+
+		if uptime >= threshold {
+			currentBackoff = initialBackoff
+		}
+
+		c.mu.Lock()
+		c.backoffDelay = currentBackoff
+		c.mu.Unlock()
+
+		sleepDuration := c.CalculateBackoff(currentBackoff)
+		currentBackoff = c.nextBackoff(currentBackoff)
+
+		if err := c.sleepFn(ctx, sleepDuration); err != nil {
+			return
+		}
+	}
+}
+
+// connectAndSupervise dials the WebSocket and supervises the connection stream.
+// (Stub to be implemented in sub-issues #14 & #15)
+func (c *Client) connectAndSupervise(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
