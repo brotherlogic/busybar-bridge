@@ -231,11 +231,11 @@ func (c *Client) Close() error {
 	conn := c.activeConn
 	c.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
 	if conn != nil {
 		_ = conn.Close(websocket.StatusNormalClosure, "shutting down")
+	}
+	if cancel != nil {
+		cancel()
 	}
 	c.wg.Wait()
 	c.closeOnce.Do(func() {
