@@ -1,0 +1,21 @@
+syntax = "proto3";
+option go_package = "github.com/brotherlogic/busybar-bridge/pkg/pb/busybar;busybar";
+
+package BSB_State;
+
+enum MatterCommissioningStatus {
+    NEVER_STARTED = 0;
+    STARTED = 1;
+    COMPLETED_SUCCESSFULLY = 2;
+    FAILED = 3;
+}
+
+message MatterCommissioningState {
+    MatterCommissioningStatus status = 1;
+    fixed64 timestamp = 2;
+}
+
+message Matter {
+    uint32 fabric_count = 1;
+    MatterCommissioningState state = 2;
+}

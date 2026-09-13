@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package busybar.event;
+option go_package = "github.com/brotherlogic/busybar-bridge/pkg/pb;pb";
+
+enum Button {
+    BUTTON_UNKNOWN = 0;
+    BUTTON_OK = 1;
+    BUTTON_BACK = 2;
+    BUTTON_START = 3;
+}
+
+enum ButtonAction {
+    ACTION_UNKNOWN = 0;
+    ACTION_PRESS = 1;
+    ACTION_RELEASE = 2;
+}
+
+enum SwitchPosition {
+    SWITCH_UNKNOWN = 0;
+    SWITCH_BUSY = 1;
+    SWITCH_CUSTOM = 2;
+    SWITCH_OFF = 3;
+    SWITCH_APPS = 4;
+    SWITCH_SETTINGS = 5;
+}
+
+message NormalizedButtonEvent {
+    string device = 1;
+    Button button = 2;
+    ButtonAction action = 3;
+    int64 timestamp = 4;
+}
+
+message NormalizedSwitchEvent {
+    string device = 1;
+    SwitchPosition position = 2;
+    int64 timestamp = 3;
+}
+
+message NormalizedEncoderEvent {
+    string device = 1;
+    int32 delta = 2;
+    int64 timestamp = 3;
+}
+
+message NormalizedEvent {
+    string device = 1;
+    int64 timestamp = 2;
+    oneof event {
+        NormalizedButtonEvent button = 3;
+        NormalizedSwitchEvent switch = 4;
+        NormalizedEncoderEvent encoder = 5;
+    }
+}

@@ -1,0 +1,8 @@
+syntax = "proto3";
+option go_package = "github.com/brotherlogic/busybar-bridge/pkg/pb/busybar;busybar";
+
+package BSB_State;
+
+message DeviceName {
+    string name = 1;
+}
