@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,3 +198,136 @@ func TestGracefulShutdown(t *testing.T) {
 		t.Errorf("expected connection error after shutdown, got nil")
 	}
 }
+
+func TestStatusPageRendering(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetConnected(true)
+	id1 := store.RecordEvent("button", "Living Room Switch toggled ON")
+	store.RecordForwardOutcome(id1, telemetry.OutcomeSuccess, 45*time.Millisecond, nil)
+	id2 := store.RecordEvent("encoder", "Dial rotated 3 steps clockwise")
+	store.RecordForwardOutcome(id2, telemetry.OutcomeFailure, 120*time.Millisecond, errors.New("timeout connecting to HA"))
+
+	srv := New(DefaultConfig(), store)
+
+	for _, path := range []string{"/status", "/"} {
+		t.Run("path_"+path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+			}
+			contentType := rec.Header().Get("Content-Type")
+			if !strings.Contains(contentType, "text/html") {
+				t.Errorf("expected Content-Type containing text/html, got %q", contentType)
+			}
+
+			body := rec.Body.String()
+			if !strings.Contains(body, `<meta http-equiv="refresh" content="5">`) {
+				t.Errorf("expected meta-refresh tag in body")
+			}
+			if !strings.Contains(body, "Connected") {
+				t.Errorf("expected Connected badge in body")
+			}
+			if !strings.Contains(body, "Living Room Switch toggled ON") {
+				t.Errorf("expected event 1 summary in body")
+			}
+			if !strings.Contains(body, "Dial rotated 3 steps clockwise") {
+				t.Errorf("expected event 2 summary in body")
+			}
+			if !strings.Contains(body, "timeout connecting to HA") {
+				t.Errorf("expected error message in body")
+			}
+		})
+	}
+}
+
+func TestStatusPageEmptyState(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetConnected(false)
+	srv := New(DefaultConfig(), store)
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	contentType := rec.Header().Get("Content-Type")
+	if !strings.Contains(contentType, "text/html") {
+		t.Errorf("expected Content-Type containing text/html, got %q", contentType)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "No events received yet") {
+		t.Errorf("expected empty state message 'No events received yet' in body")
+	}
+	if !strings.Contains(body, "Disconnected") {
+		t.Errorf("expected Disconnected badge in body")
+	}
+}
+
+func TestStatusPage_MethodNotAllowed(t *testing.T) {
+	store := telemetry.NewStore()
+	srv := New(DefaultConfig(), store)
+
+	for _, path := range []string{"/status", "/"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		rec := httptest.NewRecorder()
+
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("path %s: expected status %d, got %d", path, http.StatusMethodNotAllowed, rec.Code)
+		}
+	}
+}
+
+func TestStatusPage_NotFound(t *testing.T) {
+	store := telemetry.NewStore()
+	srv := New(DefaultConfig(), store)
+
+	req := httptest.NewRequest(http.MethodGet, "/unknown-page", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected status %d, got %d", http.StatusNotFound, rec.Code)
+	}
+}
+
+func TestStatusPage_NilStore(t *testing.T) {
+	srv := New(DefaultConfig(), nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+}
+
+func TestStatusPage_TemplateError(t *testing.T) {
+	store := telemetry.NewStore()
+	srv := New(DefaultConfig(), store)
+	// Override tmpl to nil or a template that errors out
+	srv.tmpl = nil
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, rec.Code)
+	}
+}
+
+

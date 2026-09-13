@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
+	"html/template"
 	"log"
 	"net"
 	"net/http"
@@ -12,6 +15,9 @@ import (
 
 	"github.com/brotherlogic/busybar-bridge/internal/telemetry"
 )
+
+//go:embed templates/status.html
+var statusHTML string
 
 // Config defines the HTTP server configuration parameters.
 type Config struct {
@@ -35,6 +41,7 @@ type Server struct {
 	store      *telemetry.Store
 	httpServer *http.Server
 	listener   net.Listener
+	tmpl       *template.Template
 	mu         sync.Mutex
 }
 
@@ -58,14 +65,22 @@ func New(cfg Config, store *telemetry.Store) *Server {
 		addr = fmt.Sprintf(":%d", cfg.Port)
 	}
 
+	tmpl, err := template.New("status.html").Parse(statusHTML)
+	if err != nil {
+		log.Printf("failed to parse status template: %v", err)
+	}
+
 	s := &Server{
 		cfg:   cfg,
 		store: store,
+		tmpl:  tmpl,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/ready", s.handleReady)
+	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/", s.handleStatus)
 
 	s.httpServer = &http.Server{
 		Addr:         addr,
@@ -190,3 +205,35 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write([]byte("not ready\n"))
 }
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/status" && r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var snapshot telemetry.Snapshot
+	if s.store != nil {
+		snapshot = s.store.Snapshot()
+	}
+
+	if s.tmpl == nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	var buf bytes.Buffer
+	if err := s.tmpl.Execute(&buf, snapshot); err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
+}
+
