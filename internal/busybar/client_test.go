@@ -1,7 +1,9 @@
 package busybar
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -187,3 +189,219 @@ func TestThreadSafeStatusAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestCalculateBackoff_BoundariesAndJitter(t *testing.T) {
+	client := NewClient(Config{
+		InitialBackoff: 1 * time.Second,
+		MaxBackoff:     10 * time.Second,
+	})
+
+	current := 4 * time.Second
+	maxBackoff := 10 * time.Second
+
+	// Verify jitter stays within [0, current] when current < maxBackoff
+	seenDifferent := false
+	var firstVal time.Duration
+	for i := 0; i < 100; i++ {
+		b := CalculateBackoff(current, maxBackoff)
+		if b < 0 || b > current {
+			t.Fatalf("CalculateBackoff(%v, %v) = %v out of bounds [0, %v]", current, maxBackoff, b, current)
+		}
+		if i == 0 {
+			firstVal = b
+		} else if b != firstVal {
+			seenDifferent = true
+		}
+	}
+	if !seenDifferent {
+		t.Errorf("expected jitter to produce varied backoff values, but all were identical: %v", firstVal)
+	}
+
+	// Verify jitter stays within [0, maxBackoff] when current > maxBackoff
+	currentOverMax := 20 * time.Second
+	for i := 0; i < 100; i++ {
+		b := client.CalculateBackoff(currentOverMax)
+		if b < 0 || b > maxBackoff {
+			t.Fatalf("client.CalculateBackoff(%v) = %v out of bounds [0, %v]", currentOverMax, b, maxBackoff)
+		}
+	}
+
+	// Edge case: zero or negative backoff
+	if b := CalculateBackoff(0, maxBackoff); b != 0 {
+		t.Errorf("expected 0 for zero current backoff, got %v", b)
+	}
+}
+
+func TestBackoffProgression(t *testing.T) {
+	cfg := Config{
+		InitialBackoff:    1 * time.Second,
+		MaxBackoff:        5 * time.Second,
+		BackoffMultiplier: 2.0,
+	}
+	client := NewClient(cfg)
+
+	current := client.Config().InitialBackoff
+	expected := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		5 * time.Second, // Capped at MaxBackoff
+		5 * time.Second,
+	}
+
+	for step, exp := range expected {
+		if current != exp {
+			t.Errorf("step %d: expected backoff %v, got %v", step, exp, current)
+		}
+		next := client.nextBackoff(current)
+		current = next
+	}
+}
+
+func TestReconnectionLoop_TelemetryAndLifecycle(t *testing.T) {
+	client := NewClient(Config{
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+	})
+
+	// Override sleepFn to execute immediately without actual delay
+	client.sleepFn = func(ctx context.Context, d time.Duration) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+
+	done := make(chan struct{})
+	var once sync.Once
+	dropCount := 0
+	client.connectFn = func(ctx context.Context) error {
+		client.mu.Lock()
+		dropCount++
+		client.status.Connected = true
+		client.status.LastConnectedAt = time.Now()
+		count := dropCount
+		client.mu.Unlock()
+
+		if count >= 3 {
+			once.Do(func() { close(done) })
+		}
+		return errors.New("simulated connection drop")
+	}
+
+	ctx := context.Background()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	// Start again should error
+	if err := client.Start(ctx); err == nil {
+		t.Errorf("expected error on duplicate Start(), got nil")
+	}
+
+	// Wait for at least 3 connection drops
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for 3 reconnect attempts")
+	}
+
+	// Wait for Close
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	status := client.Status()
+	if status.Connected {
+		t.Errorf("expected Connected=false after close, got true")
+	}
+	if status.ReconnectCount < 3 {
+		t.Errorf("expected ReconnectCount >= 3, got %d", status.ReconnectCount)
+	}
+	if status.LastDisconnectedAt.IsZero() {
+		t.Errorf("expected LastDisconnectedAt to be set, got zero time")
+	}
+}
+
+func TestBackoffReset_After30SecondsUptime(t *testing.T) {
+	client := NewClient(Config{
+		InitialBackoff:    1 * time.Second,
+		MaxBackoff:        30 * time.Second,
+		BackoffMultiplier: 2.0,
+	})
+
+	var recordedDelays []time.Duration
+	var mu sync.Mutex
+	done := make(chan struct{})
+	var once sync.Once
+
+	client.sleepFn = func(ctx context.Context, d time.Duration) error {
+		mu.Lock()
+		recordedDelays = append(recordedDelays, client.CurrentBackoff())
+		count := len(recordedDelays)
+		mu.Unlock()
+
+		if count >= 3 {
+			once.Do(func() { close(done) })
+		}
+		return nil
+	}
+
+	iteration := 0
+	client.connectFn = func(ctx context.Context) error {
+		iteration++
+		client.mu.Lock()
+		client.status.Connected = true
+		switch iteration {
+		case 1:
+			// First drop after unstable connection (< 30s uptime, simulated 5s)
+			client.status.LastConnectedAt = time.Now().Add(-5 * time.Second)
+		case 2:
+			// Second drop after another unstable connection (simulated 10s)
+			client.status.LastConnectedAt = time.Now().Add(-10 * time.Second)
+		case 3:
+			// Third drop after STABLE connection (>= 30s uptime, simulated 35s)
+			client.status.LastConnectedAt = time.Now().Add(-35 * time.Second)
+		}
+		client.mu.Unlock()
+		return errors.New("drop")
+	}
+
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for 3 backoff iterations")
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	mu.Lock()
+	delays := append([]time.Duration(nil), recordedDelays...)
+	mu.Unlock()
+
+	if len(delays) < 3 {
+		t.Fatalf("expected at least 3 delay recordings, got %d", len(delays))
+	}
+
+	// Iteration 1: Initial backoff = 1s.
+	if delays[0] != 1*time.Second {
+		t.Errorf("expected initial backoff delay 1s, got %v", delays[0])
+	}
+	// Iteration 2: After unstable 5s connection, backoff progressed = 2s.
+	if delays[1] != 2*time.Second {
+		t.Errorf("expected progressed backoff delay 2s, got %v", delays[1])
+	}
+	// Iteration 3: After stable 35s connection (>= 30s), backoff delay MUST reset to InitialBackoff (1s).
+	if delays[2] != 1*time.Second {
+		t.Errorf("expected backoff delay after 35s stable uptime to reset to 1s, got %v", delays[2])
+	}
+}
+
