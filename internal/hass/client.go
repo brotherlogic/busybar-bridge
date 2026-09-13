@@ -1,10 +1,16 @@
 package hass
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -149,6 +155,10 @@ func (c *Client) Enqueue(event Event) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now()
+	}
+
 	if c.closed {
 		c.overflowDrops.Add(1)
 		if c.store != nil {
@@ -195,10 +205,85 @@ func (c *Client) worker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-c.eventsChan:
+		case event, ok := <-c.eventsChan:
 			if !ok {
 				return
 			}
+			c.dispatch(ctx, event)
 		}
+	}
+}
+
+// dispatch processes a single event: evaluates TTL staleness, constructs the HTTP POST request,
+// dispatches it to Home Assistant, and records the outcome and latency in the telemetry store.
+func (c *Client) dispatch(ctx context.Context, event Event) {
+	// Pre-dispatch TTL staleness evaluation
+	createdAt := event.CreatedAt
+	if createdAt.IsZero() {
+		if event.Timestamp > 0 {
+			createdAt = time.Unix(event.Timestamp, 0)
+		} else {
+			createdAt = time.Now()
+		}
+	}
+
+	if time.Since(createdAt) > c.cfg.TTL {
+		if c.store != nil {
+			c.store.RecordDrop("ttl_expired")
+		}
+		return
+	}
+
+	traceID := event.TraceID
+	if traceID == 0 && event.ID != "" {
+		if id, err := strconv.ParseInt(event.ID, 10, 64); err == nil {
+			traceID = id
+		}
+	}
+
+	eventType := c.cfg.EventType
+	if eventType == "" {
+		eventType = string(event.Type)
+	}
+	postURL := fmt.Sprintf("%s/api/events/%s", strings.TrimRight(c.cfg.BaseURL, "/"), eventType)
+
+	bodyBytes, err := json.Marshal(event)
+	if err != nil {
+		if c.store != nil {
+			c.store.RecordForwardOutcome(traceID, telemetry.OutcomeFailure, 0, err)
+		}
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, postURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		if c.store != nil {
+			c.store.RecordForwardOutcome(traceID, telemetry.OutcomeFailure, 0, err)
+		}
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	start := time.Now()
+	resp, err := c.httpClient.Do(req)
+	latency := time.Since(start)
+
+	var outcome telemetry.ForwardingOutcome
+	if err != nil {
+		outcome = telemetry.OutcomeFailure
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			outcome = telemetry.OutcomeSuccess
+		} else {
+			outcome = telemetry.OutcomeFailure
+			err = fmt.Errorf("http error: %s", resp.Status)
+		}
+	}
+
+	if c.store != nil {
+		c.store.RecordForwardOutcome(traceID, outcome, latency, err)
 	}
 }

@@ -2,7 +2,11 @@ package hass_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -230,5 +234,238 @@ func TestConcurrentEnqueueAndClose(t *testing.T) {
 	expectedTotal := int64(numGoroutines * eventsPerGoroutine)
 	if total != expectedTotal {
 		t.Fatalf("expected %d total attempts, got %d", expectedTotal, total)
+	}
+}
+
+func TestBearerAuthentication(t *testing.T) {
+	const expectedToken = "secret-token-xyz"
+	const expectedEventType = "busybar_event"
+
+	var receivedAuthHeader string
+	var receivedContentType string
+	var receivedPath string
+	var receivedMethod string
+	var receivedBody map[string]interface{}
+	reqReceived := make(chan struct{}, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		receivedAuthHeader = r.Header.Get("Authorization")
+		receivedContentType = r.Header.Get("Content-Type")
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = json.Unmarshal(body, &receivedBody)
+
+		w.WriteHeader(http.StatusOK)
+		close(reqReceived)
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = expectedToken
+	cfg.EventType = expectedEventType
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	ev := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, 1726180000)
+	if ok := client.Enqueue(ev); !ok {
+		t.Fatalf("expected Enqueue to succeed")
+	}
+
+	select {
+	case <-reqReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for mock server request")
+	}
+
+	// Wait for client to complete dispatch and record telemetry
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if store.Snapshot().Forwarding.TotalDispatched > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	if receivedMethod != http.MethodPost {
+		t.Errorf("expected method POST, got %s", receivedMethod)
+	}
+	expectedPath := "/api/events/" + expectedEventType
+	if receivedPath != expectedPath {
+		t.Errorf("expected path %s, got %s", expectedPath, receivedPath)
+	}
+	expectedAuth := "Bearer " + expectedToken
+	if receivedAuthHeader != expectedAuth {
+		t.Errorf("expected Authorization %q, got %q", expectedAuth, receivedAuthHeader)
+	}
+	if receivedContentType != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", receivedContentType)
+	}
+	if receivedBody["device"] != "busybar" || receivedBody["button"] != "ok" || receivedBody["action"] != "press" {
+		t.Errorf("unexpected body payload: %+v", receivedBody)
+	}
+
+	snap := store.Snapshot()
+	if snap.Forwarding.TotalAcked != 1 {
+		t.Errorf("expected 1 TotalAcked in telemetry store, got %d", snap.Forwarding.TotalAcked)
+	}
+}
+
+func TestStrictFIFOOrdering(t *testing.T) {
+	const numEvents = 20
+
+	var mu sync.Mutex
+	var receivedTimestamps []int64
+	allReceived := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		var payload struct {
+			Timestamp int64 `json:"timestamp"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		receivedTimestamps = append(receivedTimestamps, payload.Timestamp)
+		count := len(receivedTimestamps)
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+
+		if count == numEvents {
+			close(allReceived)
+		}
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = "test-token"
+	cfg.BufferSize = numEvents * 2
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	for i := 0; i < numEvents; i++ {
+		ev := hass.NewButtonEvent("busybar", hass.ButtonStart, hass.ActionPress, int64(1000+i))
+		if ok := client.Enqueue(ev); !ok {
+			t.Fatalf("failed to enqueue event %d", i)
+		}
+	}
+
+	select {
+	case <-allReceived:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for all %d events to be received", numEvents)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(receivedTimestamps) != numEvents {
+		t.Fatalf("expected %d events, got %d", numEvents, len(receivedTimestamps))
+	}
+
+	for i := 0; i < numEvents; i++ {
+		expectedTS := int64(1000 + i)
+		if receivedTimestamps[i] != expectedTS {
+			t.Fatalf("event at index %d: expected timestamp %d, got %d (ordering violated)", i, expectedTS, receivedTimestamps[i])
+		}
+	}
+}
+
+func TestTTLExpirationDrop(t *testing.T) {
+	var requestCount atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := hass.DefaultConfig()
+	cfg.BaseURL = server.URL
+	cfg.Token = "test-token"
+	cfg.TTL = 100 * time.Millisecond
+
+	store := telemetry.NewStore()
+	client, err := hass.NewClient(cfg, store)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+
+	// Create an event that was created well beyond the 100ms TTL (10 seconds ago)
+	expiredEvent := hass.NewButtonEvent("busybar", hass.ButtonOK, hass.ActionPress, time.Now().Add(-10*time.Second).Unix())
+	expiredEvent.CreatedAt = time.Now().Add(-10 * time.Second)
+
+	if ok := client.Enqueue(expiredEvent); !ok {
+		t.Fatalf("expected Enqueue to succeed")
+	}
+
+	// Give the worker time to process the event
+	time.Sleep(150 * time.Millisecond)
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client: %v", err)
+	}
+
+	// Server should have received 0 requests because the event was stale
+	if got := requestCount.Load(); got != 0 {
+		t.Fatalf("expected 0 HTTP requests to mock server, got %d", got)
+	}
+
+	// Telemetry store must record the drop
+	if store.DropCount() != 1 {
+		t.Fatalf("expected 1 dropped event in telemetry store, got %d", store.DropCount())
 	}
 }
