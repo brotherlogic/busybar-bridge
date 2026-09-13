@@ -3,9 +3,15 @@ package busybar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 const defaultStableConnectionThreshold = 30 * time.Second
@@ -42,6 +48,7 @@ type Client struct {
 	sleepFn         func(ctx context.Context, d time.Duration) error
 	stableThreshold time.Duration
 	backoffDelay    time.Duration
+	activeConn      *websocket.Conn
 }
 
 // DefaultConfig returns sensible production defaults for the Busy Bar client.
@@ -209,13 +216,61 @@ func (c *Client) Start(ctx context.Context) error {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	cancel := c.cancel
+	conn := c.activeConn
 	c.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
+	if conn != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "shutting down")
+	}
 	c.wg.Wait()
 	return nil
+}
+
+// endpointURL formats the WebSocket endpoint URL based on client configuration.
+func (c *Client) endpointURL() string {
+	c.mu.RLock()
+	host := c.cfg.Host
+	port := c.cfg.Port
+	c.mu.RUnlock()
+
+	trimmed := host
+	scheme := "ws"
+	if strings.HasPrefix(trimmed, "http://") {
+		trimmed = strings.TrimPrefix(trimmed, "http://")
+	} else if strings.HasPrefix(trimmed, "https://") {
+		trimmed = strings.TrimPrefix(trimmed, "https://")
+		scheme = "wss"
+	} else if strings.HasPrefix(trimmed, "ws://") {
+		trimmed = strings.TrimPrefix(trimmed, "ws://")
+	} else if strings.HasPrefix(trimmed, "wss://") {
+		trimmed = strings.TrimPrefix(trimmed, "wss://")
+		scheme = "wss"
+	}
+
+	trimmed = strings.TrimRight(trimmed, "/")
+	if idx := strings.Index(trimmed, "/"); idx != -1 {
+		trimmed = trimmed[:idx]
+	}
+
+	var hostPort string
+	if h, p, err := net.SplitHostPort(trimmed); err == nil {
+		if port > 0 {
+			hostPort = net.JoinHostPort(h, strconv.Itoa(port))
+		} else {
+			hostPort = net.JoinHostPort(h, p)
+		}
+	} else {
+		if port > 0 {
+			hostPort = net.JoinHostPort(trimmed, strconv.Itoa(port))
+		} else {
+			hostPort = trimmed
+		}
+	}
+
+	return fmt.Sprintf("%s://%s/api/status/ws", scheme, hostPort)
 }
 
 // run is the background reconnection loop with exponential backoff and full jitter.
@@ -285,9 +340,93 @@ func (c *Client) run(ctx context.Context) {
 	}
 }
 
-// connectAndSupervise dials the WebSocket and supervises the connection stream.
-// (Stub to be implemented in sub-issues #14 & #15)
+// connectAndSupervise dials the WebSocket endpoint, conducts stream activation handshake,
+// runs the keepalive ping ticker loop, and supervises the connection stream.
 func (c *Client) connectAndSupervise(ctx context.Context) error {
-	<-ctx.Done()
-	return ctx.Err()
+	endpoint := c.endpointURL()
+
+	c.mu.RLock()
+	dialTimeout := c.cfg.ReadTimeout
+	pingInterval := c.cfg.PingInterval
+	c.mu.RUnlock()
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
+	conn, _, err := websocket.Dial(dialCtx, endpoint, nil)
+	dialCancel()
+	if err != nil {
+		return err
+	}
+	defer conn.Close(websocket.StatusInternalError, "connection closed")
+
+	if ctx.Err() != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "shutting down")
+		return ctx.Err()
+	}
+
+	c.mu.Lock()
+	c.activeConn = conn
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		if c.activeConn == conn {
+			c.activeConn = nil
+		}
+		c.mu.Unlock()
+	}()
+
+	// Send stream activation message {"enable": true} as websocket.MessageText
+	writeCtx, writeCancel := context.WithTimeout(ctx, 5*time.Second)
+	err = conn.Write(writeCtx, websocket.MessageText, []byte(`{"enable": true}`))
+	writeCancel()
+	if err != nil {
+		_ = conn.Close(websocket.StatusInternalError, "activation write failed")
+		return err
+	}
+
+	// Update telemetry state on connection establishment
+	c.mu.Lock()
+	c.status.Connected = true
+	c.status.LastConnectedAt = time.Now()
+	c.mu.Unlock()
+
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
+	// Start keepalive ping ticker in a child goroutine periodically sending conn.Ping(ctx) every PingInterval
+	var pingWg sync.WaitGroup
+	pingWg.Add(1)
+	go func() {
+		defer pingWg.Done()
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case <-ticker.C:
+				if err := conn.Ping(connCtx); err != nil {
+					connCancel()
+					return
+				}
+			}
+		}
+	}()
+	defer pingWg.Wait()
+
+	// Read loop supervision
+	err = c.readLoop(connCtx, conn)
+	connCancel()
+	return err
 }
+
+func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
+	for {
+		_, _, err := conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+	}
+}
+
