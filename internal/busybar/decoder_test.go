@@ -1,6 +1,9 @@
 package busybar_test
 
 import (
+	"context"
+	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -689,5 +692,405 @@ func TestTimestampFallback(t *testing.T) {
 	}
 	if events[0].GetButton().GetTimestamp() != ts {
 		t.Errorf("inner button event timestamp %d does not match parent timestamp %d", events[0].GetButton().GetTimestamp(), ts)
+	}
+}
+
+func TestStreamingWorker(t *testing.T) {
+	recorder := &mockMetricsRecorder{}
+	d := busybar.NewDecoder("busybar", recorder)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	frames := make(chan []byte, 10)
+	out := make(chan *pb.NormalizedEvent, 10)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Run(ctx, frames, out)
+	}()
+
+	// Build two test frames with valid button and encoder events
+	state1 := &pb_busybar.State{
+		Timestamp: 1726180000,
+		Updates: []*pb_busybar.StateUpdate{
+			{
+				State: &pb_busybar.StateUpdate_Input{
+					Input: &pb_busybar.InputEvent{
+						Event: &pb_busybar.InputEvent_ButtonEvent{
+							ButtonEvent: &pb_busybar.ButtonEvent{
+								Button: pb_busybar.Button_OK,
+								Action: pb_busybar.ButtonAction_PRESS,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	payload1, err := proto.Marshal(state1)
+	if err != nil {
+		t.Fatalf("failed to marshal frame 1: %v", err)
+	}
+
+	state2 := &pb_busybar.State{
+		Timestamp: 1726180001,
+		Updates: []*pb_busybar.StateUpdate{
+			{
+				State: &pb_busybar.StateUpdate_Input{
+					Input: &pb_busybar.InputEvent{
+						Event: &pb_busybar.InputEvent_EncoderEvent{
+							EncoderEvent: &pb_busybar.EncoderEvent{
+								Delta: 2,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	payload2, err := proto.Marshal(state2)
+	if err != nil {
+		t.Fatalf("failed to marshal frame 2: %v", err)
+	}
+
+	frames <- payload1
+	frames <- payload2
+
+	// Read and verify in-order delivery
+	select {
+	case evt1 := <-out:
+		btn := evt1.GetButton()
+		if btn == nil || btn.GetButton() != pb.Button_BUTTON_OK || btn.GetAction() != pb.ButtonAction_ACTION_PRESS {
+			t.Fatalf("unexpected first event: %v", evt1)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for event 1")
+	}
+
+	select {
+	case evt2 := <-out:
+		enc := evt2.GetEncoder()
+		if enc == nil || enc.GetDelta() != 2 {
+			t.Fatalf("unexpected second event: %v", evt2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for event 2")
+	}
+
+	// Cancel context and verify graceful shutdown
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("expected context.Canceled or nil, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Run to stop after context cancellation")
+	}
+}
+
+func TestStreamingWorker_ChannelSaturation(t *testing.T) {
+	recorder := &mockMetricsRecorder{}
+	d := busybar.NewDecoder("busybar", recorder)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	frames := make(chan []byte, 5)
+	// unbuffered out channel that is not read from to trigger saturation
+	out := make(chan *pb.NormalizedEvent)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Run(ctx, frames, out)
+	}()
+
+	state := &pb_busybar.State{
+		Timestamp: 1726180000,
+		Updates: []*pb_busybar.StateUpdate{
+			{
+				State: &pb_busybar.StateUpdate_Input{
+					Input: &pb_busybar.InputEvent{
+						Event: &pb_busybar.InputEvent_ButtonEvent{
+							ButtonEvent: &pb_busybar.ButtonEvent{
+								Button: pb_busybar.Button_OK,
+								Action: pb_busybar.ButtonAction_PRESS,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	payload, _ := proto.Marshal(state)
+	frames <- payload
+
+	// Wait briefly for Run to attempt dispatch and trigger drop
+	deadline := time.Now().Add(500 * time.Millisecond)
+	dropped := 0
+	for time.Now().Before(deadline) {
+		recorder.mu.Lock()
+		dropped = recorder.droppedFrameCalls
+		recorder.mu.Unlock()
+		if dropped > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if dropped == 0 {
+		t.Errorf("expected RecordDroppedFrame to be called when out channel is saturated, got %d", dropped)
+	}
+
+	cancel()
+	<-errCh
+}
+
+func TestHomeAssistantJSONSerialization(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    *pb.NormalizedEvent
+		expected map[string]interface{}
+	}{
+		{
+			name: "Button OK Press",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180000,
+				Event: &pb.NormalizedEvent_Button{
+					Button: &pb.NormalizedButtonEvent{
+						Device:    "busybar",
+						Button:    pb.Button_BUTTON_OK,
+						Action:    pb.ButtonAction_ACTION_PRESS,
+						Timestamp: 1726180000,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "button",
+				"button":    "ok",
+				"action":    "press",
+				"timestamp": float64(1726180000),
+			},
+		},
+		{
+			name: "Button Back Release",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180001,
+				Event: &pb.NormalizedEvent_Button{
+					Button: &pb.NormalizedButtonEvent{
+						Device:    "busybar",
+						Button:    pb.Button_BUTTON_BACK,
+						Action:    pb.ButtonAction_ACTION_RELEASE,
+						Timestamp: 1726180001,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "button",
+				"button":    "back",
+				"action":    "release",
+				"timestamp": float64(1726180001),
+			},
+		},
+		{
+			name: "Button Start Press",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180002,
+				Event: &pb.NormalizedEvent_Button{
+					Button: &pb.NormalizedButtonEvent{
+						Device:    "busybar",
+						Button:    pb.Button_BUTTON_START,
+						Action:    pb.ButtonAction_ACTION_PRESS,
+						Timestamp: 1726180002,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "button",
+				"button":    "start",
+				"action":    "press",
+				"timestamp": float64(1726180002),
+			},
+		},
+		{
+			name: "Switch Busy",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180003,
+				Event: &pb.NormalizedEvent_Switch{
+					Switch: &pb.NormalizedSwitchEvent{
+						Device:    "busybar",
+						Position:  pb.SwitchPosition_SWITCH_BUSY,
+						Timestamp: 1726180003,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "switch",
+				"position":  "busy",
+				"timestamp": float64(1726180003),
+			},
+		},
+		{
+			name: "Switch Custom",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180004,
+				Event: &pb.NormalizedEvent_Switch{
+					Switch: &pb.NormalizedSwitchEvent{
+						Device:    "busybar",
+						Position:  pb.SwitchPosition_SWITCH_CUSTOM,
+						Timestamp: 1726180004,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "switch",
+				"position":  "custom",
+				"timestamp": float64(1726180004),
+			},
+		},
+		{
+			name: "Switch Off",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180005,
+				Event: &pb.NormalizedEvent_Switch{
+					Switch: &pb.NormalizedSwitchEvent{
+						Device:    "busybar",
+						Position:  pb.SwitchPosition_SWITCH_OFF,
+						Timestamp: 1726180005,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "switch",
+				"position":  "off",
+				"timestamp": float64(1726180005),
+			},
+		},
+		{
+			name: "Switch Apps",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180006,
+				Event: &pb.NormalizedEvent_Switch{
+					Switch: &pb.NormalizedSwitchEvent{
+						Device:    "busybar",
+						Position:  pb.SwitchPosition_SWITCH_APPS,
+						Timestamp: 1726180006,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "switch",
+				"position":  "apps",
+				"timestamp": float64(1726180006),
+			},
+		},
+		{
+			name: "Switch Settings",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180007,
+				Event: &pb.NormalizedEvent_Switch{
+					Switch: &pb.NormalizedSwitchEvent{
+						Device:    "busybar",
+						Position:  pb.SwitchPosition_SWITCH_SETTINGS,
+						Timestamp: 1726180007,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "switch",
+				"position":  "settings",
+				"timestamp": float64(1726180007),
+			},
+		},
+		{
+			name: "Encoder Positive Delta",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180008,
+				Event: &pb.NormalizedEvent_Encoder{
+					Encoder: &pb.NormalizedEncoderEvent{
+						Device:    "busybar",
+						Delta:     1,
+						Timestamp: 1726180008,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "encoder",
+				"delta":     float64(1),
+				"timestamp": float64(1726180008),
+			},
+		},
+		{
+			name: "Encoder Negative Delta",
+			event: &pb.NormalizedEvent{
+				Device:    "busybar",
+				Timestamp: 1726180009,
+				Event: &pb.NormalizedEvent_Encoder{
+					Encoder: &pb.NormalizedEncoderEvent{
+						Device:    "busybar",
+						Delta:     -3,
+						Timestamp: 1726180009,
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"device":    "busybar",
+				"type":      "encoder",
+				"delta":     float64(-3),
+				"timestamp": float64(1726180009),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Test helper on event
+			data, err := tc.event.ToHomeAssistantJSON()
+			if err != nil {
+				t.Fatalf("event.ToHomeAssistantJSON() failed: %v", err)
+			}
+
+			var actual map[string]interface{}
+			if err := json.Unmarshal(data, &actual); err != nil {
+				t.Fatalf("failed to unmarshal generated JSON: %v", err)
+			}
+
+			if !reflect.DeepEqual(actual, tc.expected) {
+				t.Errorf("JSON mismatch:\nGot:  %#v\nWant: %#v", actual, tc.expected)
+			}
+
+			// Test helper in busybar package
+			data2, err := busybar.ToHomeAssistantJSON(tc.event)
+			if err != nil {
+				t.Fatalf("busybar.ToHomeAssistantJSON() failed: %v", err)
+			}
+			var actual2 map[string]interface{}
+			if err := json.Unmarshal(data2, &actual2); err != nil {
+				t.Fatalf("failed to unmarshal generated JSON from package function: %v", err)
+			}
+			if !reflect.DeepEqual(actual2, tc.expected) {
+				t.Errorf("package function JSON mismatch:\nGot:  %#v\nWant: %#v", actual2, tc.expected)
+			}
+		})
 	}
 }

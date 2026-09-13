@@ -1,6 +1,7 @@
 package busybar
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -118,6 +119,48 @@ func (d *Decoder) Decode(payload []byte) ([]*pb.NormalizedEvent, error) {
 	}
 
 	return events, nil
+}
+
+// Run continuously ingests binary frames from the frames channel, decodes them into normalized events,
+// and emits them sequentially to the out channel. Saturated out channels are handled non-blockingly by
+// dropping the event and invoking RecordDroppedFrame. Cleanly shuts down on context cancellation or channel close.
+func (d *Decoder) Run(ctx context.Context, frames <-chan []byte, out chan<- *pb.NormalizedEvent) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case frame, ok := <-frames:
+			if !ok {
+				return nil
+			}
+			events, err := d.Decode(frame)
+			if err != nil {
+				continue
+			}
+			for _, evt := range events {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case out <- evt:
+				default:
+					d.recorder.RecordDroppedFrame()
+				}
+			}
+		}
+	}
+}
+
+// ToHomeAssistantJSON serializes a NormalizedEvent into Home Assistant JSON payload matching INTENT.md.
+func (d *Decoder) ToHomeAssistantJSON(evt *pb.NormalizedEvent) ([]byte, error) {
+	return ToHomeAssistantJSON(evt)
+}
+
+// ToHomeAssistantJSON serializes a NormalizedEvent into Home Assistant JSON payload matching INTENT.md.
+func ToHomeAssistantJSON(evt *pb.NormalizedEvent) ([]byte, error) {
+	if evt == nil {
+		return nil, fmt.Errorf("normalized event is nil")
+	}
+	return evt.ToHomeAssistantJSON()
 }
 
 func mapButton(b pb_busybar.Button) pb.Button {
