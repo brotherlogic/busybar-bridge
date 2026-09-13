@@ -48,6 +48,7 @@ type Event struct {
 	Timestamp int64                  `json:"timestamp"`
 	CreatedAt time.Time              `json:"-"`
 	Data      map[string]interface{} `json:"-"`
+	TraceID   int64                  `json:"-"`
 }
 
 // ButtonPayload represents the Home Assistant JSON payload for button events per INTENT.md.
