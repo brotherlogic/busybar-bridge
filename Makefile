@@ -29,6 +29,7 @@ proto-gen:
 	mkdir -p $(PB_DIR)/busybar
 	protoc -I=$(BUSYBAR_PROTO_DIR) --go_out=. --go_opt=module=github.com/brotherlogic/busybar-bridge $$(find $(BUSYBAR_PROTO_DIR) -name "*.proto")
 	protoc -I=$(PROTO_DIR) --go_out=. --go_opt=module=github.com/brotherlogic/busybar-bridge $(PROTO_DIR)/event.proto
+	protoc -I=$(PROTO_DIR) --go_out=. --go_opt=module=github.com/brotherlogic/busybar-bridge $(PROTO_DIR)/calendar.proto
 	@echo "Protobuf Go bindings generated in $(PB_DIR)."
 
 test:
