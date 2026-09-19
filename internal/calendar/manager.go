@@ -92,6 +92,14 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 }
 
+// IsConfigured returns true if ClientID and ClientSecret are non-empty.
+func (m *Manager) IsConfigured() bool {
+	if m == nil {
+		return false
+	}
+	return strings.TrimSpace(m.cfg.ClientID) != "" && strings.TrimSpace(m.cfg.ClientSecret) != ""
+}
+
 // GenerateAuthURL generates a cryptographically secure 32-byte CSRF state nonce
 // and returns the Google OAuth authorization URL requesting offline access and consent prompt.
 func (m *Manager) GenerateAuthURL() (string, string, error) {
