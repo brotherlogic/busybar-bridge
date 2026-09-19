@@ -25,6 +25,8 @@ var (
 	ErrInvalidHassTimeout = errors.New("hass_timeout must be positive")
 	// ErrInvalidShutdownTimeout indicates the shutdown timeout is not positive.
 	ErrInvalidShutdownTimeout = errors.New("shutdown_timeout must be positive")
+	// ErrInvalidGoogleRedirectURL indicates the Google OAuth redirect URL is invalid.
+	ErrInvalidGoogleRedirectURL = errors.New("invalid google_redirect_url: must be a valid http or https URL")
 )
 
 // AppConfig defines application configuration parameters.
@@ -40,6 +42,10 @@ type AppConfig struct {
 	Port               int
 	ShutdownTimeout    time.Duration
 	LogLevel           string
+	GoogleClientID     string
+	GoogleClientSecret string
+	GoogleRedirectURL  string
+	CalendarStorePath  string
 }
 
 // DefaultConfig returns a new AppConfig populated with default values.
@@ -56,7 +62,16 @@ func DefaultConfig() *AppConfig {
 		Port:               8080,
 		ShutdownTimeout:    10 * time.Second,
 		LogLevel:           "info",
+		GoogleClientID:     "",
+		GoogleClientSecret: "",
+		GoogleRedirectURL:  "http://localhost:8080/oauth/google/callback",
+		CalendarStorePath:  "/data/calendar_binding.pb",
 	}
+}
+
+// IsOAuthConfigured returns true when both GoogleClientID and GoogleClientSecret are non-empty.
+func (c *AppConfig) IsOAuthConfigured() bool {
+	return strings.TrimSpace(c.GoogleClientID) != "" && strings.TrimSpace(c.GoogleClientSecret) != ""
 }
 
 // Validate checks that AppConfig satisfies all fail-fast invariants.
@@ -78,6 +93,19 @@ func (c *AppConfig) Validate() error {
 	}
 	if u.Host == "" {
 		return fmt.Errorf("%w: host is empty", ErrInvalidHassURL)
+	}
+
+	if strings.TrimSpace(c.GoogleRedirectURL) != "" {
+		gu, err := url.ParseRequestURI(c.GoogleRedirectURL)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidGoogleRedirectURL, err)
+		}
+		if gu.Scheme != "http" && gu.Scheme != "https" {
+			return fmt.Errorf("%w: scheme %q not supported", ErrInvalidGoogleRedirectURL, gu.Scheme)
+		}
+		if gu.Host == "" {
+			return fmt.Errorf("%w: host is empty", ErrInvalidGoogleRedirectURL)
+		}
 	}
 
 	if c.Port < 1 || c.Port > 65535 {
@@ -157,6 +185,18 @@ func Parse(args []string) (*AppConfig, error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		cfg.LogLevel = v
 	}
+	if v := os.Getenv("GOOGLE_CLIENT_ID"); v != "" {
+		cfg.GoogleClientID = v
+	}
+	if v := os.Getenv("GOOGLE_CLIENT_SECRET"); v != "" {
+		cfg.GoogleClientSecret = v
+	}
+	if v := os.Getenv("GOOGLE_REDIRECT_URL"); v != "" {
+		cfg.GoogleRedirectURL = v
+	}
+	if v := os.Getenv("CALENDAR_STORE_PATH"); v != "" {
+		cfg.CalendarStorePath = v
+	}
 
 	// Parse CLI flags
 	fs := flag.NewFlagSet("busybar-bridge", flag.ContinueOnError)
@@ -183,6 +223,14 @@ func Parse(args []string) (*AppConfig, error) {
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown_timeout", cfg.ShutdownTimeout, "Graceful shutdown timeout (alias)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "Logging level (debug, info, warn, error)")
 	fs.StringVar(&cfg.LogLevel, "log_level", cfg.LogLevel, "Logging level (debug, info, warn, error) (alias)")
+	fs.StringVar(&cfg.GoogleClientID, "google-client-id", cfg.GoogleClientID, "Google OAuth client ID")
+	fs.StringVar(&cfg.GoogleClientID, "google_client_id", cfg.GoogleClientID, "Google OAuth client ID (alias)")
+	fs.StringVar(&cfg.GoogleClientSecret, "google-client-secret", cfg.GoogleClientSecret, "Google OAuth client secret")
+	fs.StringVar(&cfg.GoogleClientSecret, "google_client_secret", cfg.GoogleClientSecret, "Google OAuth client secret (alias)")
+	fs.StringVar(&cfg.GoogleRedirectURL, "google-redirect-url", cfg.GoogleRedirectURL, "Google OAuth redirect URL")
+	fs.StringVar(&cfg.GoogleRedirectURL, "google_redirect_url", cfg.GoogleRedirectURL, "Google OAuth redirect URL (alias)")
+	fs.StringVar(&cfg.CalendarStorePath, "calendar-store-path", cfg.CalendarStorePath, "Calendar binding persistence store path")
+	fs.StringVar(&cfg.CalendarStorePath, "calendar_store_path", cfg.CalendarStorePath, "Calendar binding persistence store path (alias)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
