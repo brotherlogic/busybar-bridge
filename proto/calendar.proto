@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package calendar;
+
+option go_package = "github.com/brotherlogic/busybar-bridge/pkg/pb";
+
+message CalendarBinding {
+    string email = 1;
+    string calendar_id = 2;
+    string access_token = 3;
+    string refresh_token = 4;
+    int64 token_expiry_unix = 5;
+    int64 linked_at_unix = 6;
+}
