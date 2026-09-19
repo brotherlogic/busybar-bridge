@@ -42,6 +42,18 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("expected LogLevel %q, got %q", "info", cfg.LogLevel)
 	}
+	if cfg.GoogleClientID != "" {
+		t.Errorf("expected empty GoogleClientID in default config, got %q", cfg.GoogleClientID)
+	}
+	if cfg.GoogleClientSecret != "" {
+		t.Errorf("expected empty GoogleClientSecret in default config, got %q", cfg.GoogleClientSecret)
+	}
+	if cfg.GoogleRedirectURL != "http://localhost:8080/oauth/google/callback" {
+		t.Errorf("expected GoogleRedirectURL %q, got %q", "http://localhost:8080/oauth/google/callback", cfg.GoogleRedirectURL)
+	}
+	if cfg.CalendarStorePath != "/data/calendar_binding.pb" {
+		t.Errorf("expected CalendarStorePath %q, got %q", "/data/calendar_binding.pb", cfg.CalendarStorePath)
+	}
 }
 
 func TestParse_DefaultsWithToken(t *testing.T) {
@@ -83,6 +95,18 @@ func TestParse_DefaultsWithToken(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("expected default LogLevel info, got %q", cfg.LogLevel)
 	}
+	if cfg.GoogleClientID != "" {
+		t.Errorf("expected default GoogleClientID empty, got %q", cfg.GoogleClientID)
+	}
+	if cfg.GoogleClientSecret != "" {
+		t.Errorf("expected default GoogleClientSecret empty, got %q", cfg.GoogleClientSecret)
+	}
+	if cfg.GoogleRedirectURL != "http://localhost:8080/oauth/google/callback" {
+		t.Errorf("expected default GoogleRedirectURL, got %q", cfg.GoogleRedirectURL)
+	}
+	if cfg.CalendarStorePath != "/data/calendar_binding.pb" {
+		t.Errorf("expected default CalendarStorePath, got %q", cfg.CalendarStorePath)
+	}
 }
 
 func TestParse_EnvironmentVariables(t *testing.T) {
@@ -97,6 +121,10 @@ func TestParse_EnvironmentVariables(t *testing.T) {
 	t.Setenv("PORT", "9000")
 	t.Setenv("SHUTDOWN_TIMEOUT", "20s")
 	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("GOOGLE_CLIENT_ID", "env-client-id")
+	t.Setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
+	t.Setenv("GOOGLE_REDIRECT_URL", "https://example.com/oauth/callback")
+	t.Setenv("CALENDAR_STORE_PATH", "/tmp/calendar.pb")
 
 	cfg, err := Parse(nil)
 	if err != nil {
@@ -136,6 +164,18 @@ func TestParse_EnvironmentVariables(t *testing.T) {
 	if cfg.LogLevel != "debug" {
 		t.Errorf("expected LogLevel debug, got %q", cfg.LogLevel)
 	}
+	if cfg.GoogleClientID != "env-client-id" {
+		t.Errorf("expected GoogleClientID %q, got %q", "env-client-id", cfg.GoogleClientID)
+	}
+	if cfg.GoogleClientSecret != "env-client-secret" {
+		t.Errorf("expected GoogleClientSecret %q, got %q", "env-client-secret", cfg.GoogleClientSecret)
+	}
+	if cfg.GoogleRedirectURL != "https://example.com/oauth/callback" {
+		t.Errorf("expected GoogleRedirectURL %q, got %q", "https://example.com/oauth/callback", cfg.GoogleRedirectURL)
+	}
+	if cfg.CalendarStorePath != "/tmp/calendar.pb" {
+		t.Errorf("expected CalendarStorePath %q, got %q", "/tmp/calendar.pb", cfg.CalendarStorePath)
+	}
 }
 
 func TestParse_CLIOverridePrecedence(t *testing.T) {
@@ -151,6 +191,10 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 	t.Setenv("PORT", "9000")
 	t.Setenv("SHUTDOWN_TIMEOUT", "20s")
 	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("GOOGLE_CLIENT_ID", "env-client-id")
+	t.Setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
+	t.Setenv("GOOGLE_REDIRECT_URL", "https://env.example.com/callback")
+	t.Setenv("CALENDAR_STORE_PATH", "/env/calendar.pb")
 
 	// Pass CLI args to override everything
 	args := []string{
@@ -165,6 +209,10 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 		"-port", "8888",
 		"-shutdown-timeout", "15s",
 		"-log-level", "warn",
+		"-google-client-id", "cli-client-id",
+		"-google-client-secret", "cli-client-secret",
+		"-google-redirect-url", "https://cli.example.com/callback",
+		"-calendar-store-path", "/cli/calendar.pb",
 	}
 
 	cfg, err := Parse(args)
@@ -205,6 +253,18 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 	if cfg.LogLevel != "warn" {
 		t.Errorf("expected LogLevel warn from CLI, got %q", cfg.LogLevel)
 	}
+	if cfg.GoogleClientID != "cli-client-id" {
+		t.Errorf("expected GoogleClientID cli-client-id from CLI, got %q", cfg.GoogleClientID)
+	}
+	if cfg.GoogleClientSecret != "cli-client-secret" {
+		t.Errorf("expected GoogleClientSecret cli-client-secret from CLI, got %q", cfg.GoogleClientSecret)
+	}
+	if cfg.GoogleRedirectURL != "https://cli.example.com/callback" {
+		t.Errorf("expected GoogleRedirectURL https://cli.example.com/callback from CLI, got %q", cfg.GoogleRedirectURL)
+	}
+	if cfg.CalendarStorePath != "/cli/calendar.pb" {
+		t.Errorf("expected CalendarStorePath /cli/calendar.pb from CLI, got %q", cfg.CalendarStorePath)
+	}
 }
 
 func TestParse_UnderscoreFlags(t *testing.T) {
@@ -219,6 +279,10 @@ func TestParse_UnderscoreFlags(t *testing.T) {
 		"-forward_state_events=true",
 		"-shutdown_timeout", "14s",
 		"-log_level", "error",
+		"-google_client_id", "under-client-id",
+		"-google_client_secret", "under-client-secret",
+		"-google_redirect_url", "https://under.example.com/callback",
+		"-calendar_store_path", "/under/calendar.pb",
 	}
 
 	cfg, err := Parse(args)
@@ -255,6 +319,18 @@ func TestParse_UnderscoreFlags(t *testing.T) {
 	}
 	if cfg.LogLevel != "error" {
 		t.Errorf("expected LogLevel error, got %q", cfg.LogLevel)
+	}
+	if cfg.GoogleClientID != "under-client-id" {
+		t.Errorf("expected GoogleClientID under-client-id, got %q", cfg.GoogleClientID)
+	}
+	if cfg.GoogleClientSecret != "under-client-secret" {
+		t.Errorf("expected GoogleClientSecret under-client-secret, got %q", cfg.GoogleClientSecret)
+	}
+	if cfg.GoogleRedirectURL != "https://under.example.com/callback" {
+		t.Errorf("expected GoogleRedirectURL https://under.example.com/callback, got %q", cfg.GoogleRedirectURL)
+	}
+	if cfg.CalendarStorePath != "/under/calendar.pb" {
+		t.Errorf("expected CalendarStorePath /under/calendar.pb, got %q", cfg.CalendarStorePath)
 	}
 }
 
@@ -493,5 +569,147 @@ func TestParse_FailFastWithoutToken(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "token") {
 		t.Errorf("expected error to mention token, got: %v", err)
+	}
+}
+
+func TestAppConfig_IsOAuthConfigured(t *testing.T) {
+	tests := []struct {
+		name     string
+		clientID string
+		secret   string
+		expected bool
+	}{
+		{
+			name:     "both empty",
+			clientID: "",
+			secret:   "",
+			expected: false,
+		},
+		{
+			name:     "client ID only",
+			clientID: "client-id",
+			secret:   "",
+			expected: false,
+		},
+		{
+			name:     "secret only",
+			clientID: "",
+			secret:   "secret-val",
+			expected: false,
+		},
+		{
+			name:     "both whitespace only",
+			clientID: "   ",
+			secret:   "   ",
+			expected: false,
+		},
+		{
+			name:     "both configured",
+			clientID: "my-client-id",
+			secret:   "my-secret",
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.GoogleClientID = tc.clientID
+			cfg.GoogleClientSecret = tc.secret
+			if got := cfg.IsOAuthConfigured(); got != tc.expected {
+				t.Errorf("IsOAuthConfigured() = %v, expected %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestValidate_GoogleRedirectURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		redirectURL string
+		expectErr   bool
+		errSub      string
+	}{
+		{
+			name:        "empty URL (allowed when unspecified)",
+			redirectURL: "",
+			expectErr:   false,
+		},
+		{
+			name:        "whitespace only URL",
+			redirectURL: "   ",
+			expectErr:   false,
+		},
+		{
+			name:        "valid http URL",
+			redirectURL: "http://localhost:8080/oauth/google/callback",
+			expectErr:   false,
+		},
+		{
+			name:        "valid https URL",
+			redirectURL: "https://example.com/oauth/callback",
+			expectErr:   false,
+		},
+		{
+			name:        "invalid scheme ftp",
+			redirectURL: "ftp://localhost:8080/oauth/callback",
+			expectErr:   true,
+			errSub:      "google_redirect_url",
+		},
+		{
+			name:        "invalid scheme ws",
+			redirectURL: "ws://localhost:8080/oauth/callback",
+			expectErr:   true,
+			errSub:      "google_redirect_url",
+		},
+		{
+			name:        "missing host",
+			redirectURL: "http://",
+			expectErr:   true,
+			errSub:      "google_redirect_url",
+		},
+		{
+			name:        "malformed URL",
+			redirectURL: "http://[invalid-ipv6",
+			expectErr:   true,
+			errSub:      "google_redirect_url",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.HassToken = "valid-token"
+			cfg.GoogleRedirectURL = tc.redirectURL
+
+			err := cfg.Validate()
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tc.redirectURL)
+				}
+				if !strings.Contains(strings.ToLower(err.Error()), tc.errSub) {
+					t.Errorf("expected error to contain %q, got: %v", tc.errSub, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error for %q: %v", tc.redirectURL, err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidate_OAuthNotRequired(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.GoogleClientID = ""
+	cfg.GoogleClientSecret = ""
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected Validate to succeed without OAuth credentials, got: %v", err)
+	}
+
+	if cfg.IsOAuthConfigured() {
+		t.Fatal("expected IsOAuthConfigured to be false")
 	}
 }
