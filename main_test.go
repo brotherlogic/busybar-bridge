@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -165,3 +166,72 @@ func TestMain_CLIExecution_MissingTokenFailure(t *testing.T) {
 		t.Fatalf("expected exit code 1, got %d", exitErr.ExitCode())
 	}
 }
+
+func TestRun_ValidationFailure_InvalidGoogleRedirectURL(t *testing.T) {
+	var stderr bytes.Buffer
+	ctx := context.Background()
+	args := []string{
+		"--hass-token=valid-token",
+		"--google-redirect-url=ftp://invalid-redirect-url",
+	}
+	code := run(ctx, args, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1 for invalid google redirect url, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid google_redirect_url") {
+		t.Fatalf("expected error message to contain 'invalid google_redirect_url', got: %s", stderr.String())
+	}
+}
+
+func TestRun_InitializationFailure_CorruptedCalendarStore(t *testing.T) {
+	tempDir := t.TempDir()
+	corruptPath := filepath.Join(tempDir, "corrupted.pb")
+	if err := os.WriteFile(corruptPath, []byte("bad-proto"), 0600); err != nil {
+		t.Fatalf("failed to write corrupt test file: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	args := []string{
+		"--hass-token=valid-token",
+		"--calendar-store-path=" + corruptPath,
+	}
+	code := run(ctx, args, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1 for corrupt calendar store, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "initialization error") || !strings.Contains(stderr.String(), "calendar store") {
+		t.Fatalf("expected stderr to contain 'initialization error' and 'calendar store', got: %s", stderr.String())
+	}
+}
+
+func TestRun_WithGoogleOAuthAndCalendarFlags(t *testing.T) {
+	tempDir := t.TempDir()
+	calPath := filepath.Join(tempDir, "calendar.pb")
+
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	args := []string{
+		"--hass-token=test-token-12345",
+		"--port=19095",
+		"--busybar-port=19096",
+		"--shutdown-timeout=500ms",
+		"--google-client-id=my-client-id",
+		"--google-client-secret=my-client-secret",
+		"--google-redirect-url=http://localhost:19095/oauth/google/callback",
+		"--calendar-store-path=" + calPath,
+	}
+
+	code := run(ctx, args, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 on graceful shutdown with OAuth flags, got %d. stderr: %s", code, stderr.String())
+	}
+}
+

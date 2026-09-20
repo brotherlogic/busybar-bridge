@@ -197,6 +197,11 @@ func NewWithOptions(cfg Config, store *telemetry.Store, opts ServerOptions) *Ser
 	return New(cfg, store, WithServerOptions(opts))
 }
 
+// NewServer is an alias for New to construct a new Server instance.
+func NewServer(cfg Config, store *telemetry.Store, opts ...ServerOption) *Server {
+	return New(cfg, store, opts...)
+}
+
 // Config returns a copy of the server configuration.
 func (s *Server) Config() Config {
 	return s.cfg
