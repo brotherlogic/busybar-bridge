@@ -38,6 +38,18 @@ const (
 	OutcomeFailure ForwardingOutcome = "failure"
 )
 
+// PushTelemetry tracks cumulative metrics for outbound frame pushes to BusyBar.
+type PushTelemetry struct {
+	Enabled        bool      `json:"enabled"`
+	TotalAttempts  int64     `json:"total_attempts"`
+	TotalSuccesses int64     `json:"total_successes"`
+	TotalFailures  int64     `json:"total_failures"`
+	TotalDropped   int64     `json:"total_dropped"`
+	LastPushAt     time.Time `json:"last_push_at,omitempty"`
+	LastLatencyMs  int64     `json:"last_latency_ms"`
+	LastError      string    `json:"last_error,omitempty"`
+}
+
 // EventTrace captures point-in-time diagnostic information for an individual event.
 type EventTrace struct {
 	ID        int64             `json:"id"`
@@ -56,6 +68,7 @@ type Snapshot struct {
 	Connection   ConnectionStatus
 	Counters     EventCounters
 	Forwarding   ForwardingTelemetry
+	Push         PushTelemetry
 	TotalEvents  int64
 	RecentEvents []EventTrace // Oldest to newest (up to 10)
 }
@@ -67,6 +80,7 @@ type Store struct {
 	connection      ConnectionStatus
 	counters        EventCounters
 	forwarding      ForwardingTelemetry
+	push            PushTelemetry
 	ringBuffer      []EventTrace
 	nextID          int64
 	totalEvents     int64
@@ -189,9 +203,54 @@ func (s *Store) Snapshot() Snapshot {
 		Connection:   s.connection,
 		Counters:     s.counters,
 		Forwarding:   s.forwarding,
+		Push:         s.push,
 		TotalEvents:  s.totalEvents,
 		RecentEvents: recent,
 	}
+}
+
+// SetPushEnabled sets whether outbound push is currently enabled.
+func (s *Store) SetPushEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.push.Enabled = enabled
+}
+
+// RecordPushAttempt increments the cumulative counter of outbound push attempts.
+func (s *Store) RecordPushAttempt() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.push.TotalAttempts++
+}
+
+// RecordPushResult records the result of an outbound push delivery, updating successes or failures,
+// delivery latency, timestamp, and any error encountered.
+func (s *Store) RecordPushResult(success bool, latency time.Duration, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.push.LastPushAt = time.Now()
+	s.push.LastLatencyMs = latency.Milliseconds()
+
+	if success {
+		s.push.TotalSuccesses++
+		s.push.LastError = ""
+	} else {
+		s.push.TotalFailures++
+		if err != nil {
+			s.push.LastError = err.Error()
+		}
+	}
+}
+
+// RecordPushDrop increments the cumulative counter of dropped or superseded outbound push frames.
+func (s *Store) RecordPushDrop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.push.TotalDropped++
 }
 
 // RecordDrop records an event drop reason in the telemetry store.
