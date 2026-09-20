@@ -54,6 +54,15 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.CalendarStorePath != "/data/calendar_binding.pb" {
 		t.Errorf("expected CalendarStorePath %q, got %q", "/data/calendar_binding.pb", cfg.CalendarStorePath)
 	}
+	if cfg.EnableOutboundPush != false {
+		t.Errorf("expected EnableOutboundPush false, got %v", cfg.EnableOutboundPush)
+	}
+	if cfg.BusyBarAPIKey != "" {
+		t.Errorf("expected empty BusyBarAPIKey in default config, got %q", cfg.BusyBarAPIKey)
+	}
+	if cfg.PushTimeout != 3*time.Second {
+		t.Errorf("expected PushTimeout 3s, got %v", cfg.PushTimeout)
+	}
 }
 
 func TestParse_DefaultsWithToken(t *testing.T) {
@@ -107,6 +116,15 @@ func TestParse_DefaultsWithToken(t *testing.T) {
 	if cfg.CalendarStorePath != "/data/calendar_binding.pb" {
 		t.Errorf("expected default CalendarStorePath, got %q", cfg.CalendarStorePath)
 	}
+	if cfg.EnableOutboundPush != false {
+		t.Errorf("expected default EnableOutboundPush false, got %v", cfg.EnableOutboundPush)
+	}
+	if cfg.BusyBarAPIKey != "" {
+		t.Errorf("expected default BusyBarAPIKey empty, got %q", cfg.BusyBarAPIKey)
+	}
+	if cfg.PushTimeout != 3*time.Second {
+		t.Errorf("expected default PushTimeout 3s, got %v", cfg.PushTimeout)
+	}
 }
 
 func TestParse_EnvironmentVariables(t *testing.T) {
@@ -125,6 +143,9 @@ func TestParse_EnvironmentVariables(t *testing.T) {
 	t.Setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
 	t.Setenv("GOOGLE_REDIRECT_URL", "https://example.com/oauth/callback")
 	t.Setenv("CALENDAR_STORE_PATH", "/tmp/calendar.pb")
+	t.Setenv("ENABLE_OUTBOUND_PUSH", "true")
+	t.Setenv("BUSYBAR_API_KEY", "env-secret-api-key")
+	t.Setenv("PUSH_TIMEOUT", "8s")
 
 	cfg, err := Parse(nil)
 	if err != nil {
@@ -176,6 +197,15 @@ func TestParse_EnvironmentVariables(t *testing.T) {
 	if cfg.CalendarStorePath != "/tmp/calendar.pb" {
 		t.Errorf("expected CalendarStorePath %q, got %q", "/tmp/calendar.pb", cfg.CalendarStorePath)
 	}
+	if cfg.EnableOutboundPush != true {
+		t.Errorf("expected EnableOutboundPush true, got %v", cfg.EnableOutboundPush)
+	}
+	if cfg.BusyBarAPIKey != "env-secret-api-key" {
+		t.Errorf("expected BusyBarAPIKey env-secret-api-key, got %q", cfg.BusyBarAPIKey)
+	}
+	if cfg.PushTimeout != 8*time.Second {
+		t.Errorf("expected PushTimeout 8s, got %v", cfg.PushTimeout)
+	}
 }
 
 func TestParse_CLIOverridePrecedence(t *testing.T) {
@@ -195,6 +225,9 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 	t.Setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
 	t.Setenv("GOOGLE_REDIRECT_URL", "https://env.example.com/callback")
 	t.Setenv("CALENDAR_STORE_PATH", "/env/calendar.pb")
+	t.Setenv("ENABLE_OUTBOUND_PUSH", "false")
+	t.Setenv("BUSYBAR_API_KEY", "env-api-key")
+	t.Setenv("PUSH_TIMEOUT", "10s")
 
 	// Pass CLI args to override everything
 	args := []string{
@@ -213,6 +246,9 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 		"-google-client-secret", "cli-client-secret",
 		"-google-redirect-url", "https://cli.example.com/callback",
 		"-calendar-store-path", "/cli/calendar.pb",
+		"-enable-outbound-push=true",
+		"-busybar-api-key", "cli-api-key",
+		"-push-timeout", "4s",
 	}
 
 	cfg, err := Parse(args)
@@ -265,6 +301,15 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 	if cfg.CalendarStorePath != "/cli/calendar.pb" {
 		t.Errorf("expected CalendarStorePath /cli/calendar.pb from CLI, got %q", cfg.CalendarStorePath)
 	}
+	if cfg.EnableOutboundPush != true {
+		t.Errorf("expected EnableOutboundPush true from CLI, got %v", cfg.EnableOutboundPush)
+	}
+	if cfg.BusyBarAPIKey != "cli-api-key" {
+		t.Errorf("expected BusyBarAPIKey cli-api-key from CLI, got %q", cfg.BusyBarAPIKey)
+	}
+	if cfg.PushTimeout != 4*time.Second {
+		t.Errorf("expected PushTimeout 4s from CLI, got %v", cfg.PushTimeout)
+	}
 }
 
 func TestParse_UnderscoreFlags(t *testing.T) {
@@ -283,6 +328,9 @@ func TestParse_UnderscoreFlags(t *testing.T) {
 		"-google_client_secret", "under-client-secret",
 		"-google_redirect_url", "https://under.example.com/callback",
 		"-calendar_store_path", "/under/calendar.pb",
+		"-enable_outbound_push=true",
+		"-busybar_api_key", "under-push-key",
+		"-push_timeout", "8s",
 	}
 
 	cfg, err := Parse(args)
@@ -332,6 +380,15 @@ func TestParse_UnderscoreFlags(t *testing.T) {
 	if cfg.CalendarStorePath != "/under/calendar.pb" {
 		t.Errorf("expected CalendarStorePath /under/calendar.pb, got %q", cfg.CalendarStorePath)
 	}
+	if cfg.EnableOutboundPush != true {
+		t.Errorf("expected EnableOutboundPush true from CLI alias, got %v", cfg.EnableOutboundPush)
+	}
+	if cfg.BusyBarAPIKey != "under-push-key" {
+		t.Errorf("expected BusyBarAPIKey under-push-key from CLI alias, got %q", cfg.BusyBarAPIKey)
+	}
+	if cfg.PushTimeout != 8*time.Second {
+		t.Errorf("expected PushTimeout 8s from CLI alias, got %v", cfg.PushTimeout)
+	}
 }
 
 func TestParse_InvalidEnvVars(t *testing.T) {
@@ -370,6 +427,18 @@ func TestParse_InvalidEnvVars(t *testing.T) {
 			envKey: "FORWARD_STATE_EVENTS",
 			envVal: "not-a-bool",
 			errSub: "FORWARD_STATE_EVENTS",
+		},
+		{
+			name:   "invalid ENABLE_OUTBOUND_PUSH",
+			envKey: "ENABLE_OUTBOUND_PUSH",
+			envVal: "not-a-bool",
+			errSub: "ENABLE_OUTBOUND_PUSH",
+		},
+		{
+			name:   "invalid PUSH_TIMEOUT",
+			envKey: "PUSH_TIMEOUT",
+			envVal: "invalid-duration",
+			errSub: "PUSH_TIMEOUT",
 		},
 	}
 
@@ -543,6 +612,20 @@ func TestValidate_Timeouts(t *testing.T) {
 			},
 			errSub: "shutdown_timeout",
 		},
+		{
+			name: "zero PushTimeout",
+			mutate: func(c *AppConfig) {
+				c.PushTimeout = 0
+			},
+			errSub: "push_timeout",
+		},
+		{
+			name: "negative PushTimeout",
+			mutate: func(c *AppConfig) {
+				c.PushTimeout = -1 * time.Second
+			},
+			errSub: "push_timeout",
+		},
 	}
 
 	for _, tc := range tests {
@@ -712,4 +795,107 @@ func TestValidate_OAuthNotRequired(t *testing.T) {
 	if cfg.IsOAuthConfigured() {
 		t.Fatal("expected IsOAuthConfigured to be false")
 	}
+}
+
+func TestOutboundPushConfig(t *testing.T) {
+	t.Run("default push settings", func(t *testing.T) {
+		cfg := DefaultConfig()
+		if cfg.EnableOutboundPush != false {
+			t.Errorf("expected EnableOutboundPush false, got %v", cfg.EnableOutboundPush)
+		}
+		if cfg.BusyBarAPIKey != "" {
+			t.Errorf("expected BusyBarAPIKey empty, got %q", cfg.BusyBarAPIKey)
+		}
+		if cfg.PushTimeout != 3*time.Second {
+			t.Errorf("expected PushTimeout 3s, got %v", cfg.PushTimeout)
+		}
+	})
+
+	t.Run("environment variable overrides for push settings", func(t *testing.T) {
+		t.Setenv("HASS_TOKEN", "token")
+		t.Setenv("ENABLE_OUTBOUND_PUSH", "true")
+		t.Setenv("BUSYBAR_API_KEY", "key-from-env")
+		t.Setenv("PUSH_TIMEOUT", "5s")
+
+		cfg, err := Parse(nil)
+		if err != nil {
+			t.Fatalf("unexpected error parsing env vars: %v", err)
+		}
+		if !cfg.EnableOutboundPush {
+			t.Errorf("expected EnableOutboundPush true, got %v", cfg.EnableOutboundPush)
+		}
+		if cfg.BusyBarAPIKey != "key-from-env" {
+			t.Errorf("expected BusyBarAPIKey 'key-from-env', got %q", cfg.BusyBarAPIKey)
+		}
+		if cfg.PushTimeout != 5*time.Second {
+			t.Errorf("expected PushTimeout 5s, got %v", cfg.PushTimeout)
+		}
+	})
+
+	t.Run("CLI flag overrides taking precedence over environment variables", func(t *testing.T) {
+		t.Setenv("HASS_TOKEN", "token")
+		t.Setenv("ENABLE_OUTBOUND_PUSH", "false")
+		t.Setenv("BUSYBAR_API_KEY", "env-key")
+		t.Setenv("PUSH_TIMEOUT", "10s")
+
+		args := []string{
+			"--enable-outbound-push=true",
+			"--busybar-api-key", "cli-key",
+			"--push-timeout", "2s",
+		}
+		cfg, err := Parse(args)
+		if err != nil {
+			t.Fatalf("unexpected error parsing CLI flags: %v", err)
+		}
+		if !cfg.EnableOutboundPush {
+			t.Errorf("expected EnableOutboundPush true from CLI, got %v", cfg.EnableOutboundPush)
+		}
+		if cfg.BusyBarAPIKey != "cli-key" {
+			t.Errorf("expected BusyBarAPIKey 'cli-key', got %q", cfg.BusyBarAPIKey)
+		}
+		if cfg.PushTimeout != 2*time.Second {
+			t.Errorf("expected PushTimeout 2s, got %v", cfg.PushTimeout)
+		}
+	})
+
+	t.Run("CLI underscore flag aliases", func(t *testing.T) {
+		t.Setenv("HASS_TOKEN", "token")
+		args := []string{
+			"--enable_outbound_push=true",
+			"--busybar_api_key", "alias-key",
+			"--push_timeout", "9s",
+		}
+		cfg, err := Parse(args)
+		if err != nil {
+			t.Fatalf("unexpected error parsing CLI alias flags: %v", err)
+		}
+		if !cfg.EnableOutboundPush {
+			t.Errorf("expected EnableOutboundPush true from CLI alias, got %v", cfg.EnableOutboundPush)
+		}
+		if cfg.BusyBarAPIKey != "alias-key" {
+			t.Errorf("expected BusyBarAPIKey 'alias-key', got %q", cfg.BusyBarAPIKey)
+		}
+		if cfg.PushTimeout != 9*time.Second {
+			t.Errorf("expected PushTimeout 9s, got %v", cfg.PushTimeout)
+		}
+	})
+
+	t.Run("validation rejection when PushTimeout <= 0", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.HassToken = "token"
+
+		cfg.PushTimeout = 0
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected error for PushTimeout=0, got nil")
+		} else if !strings.Contains(strings.ToLower(err.Error()), "push_timeout") {
+			t.Errorf("expected error mentioning push_timeout, got: %v", err)
+		}
+
+		cfg.PushTimeout = -1 * time.Second
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected error for negative PushTimeout, got nil")
+		} else if !strings.Contains(strings.ToLower(err.Error()), "push_timeout") {
+			t.Errorf("expected error mentioning push_timeout, got: %v", err)
+		}
+	})
 }
