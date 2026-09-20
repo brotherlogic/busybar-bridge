@@ -325,3 +325,171 @@ func TestRecordDrop(t *testing.T) {
 	}
 }
 
+func TestPushTelemetry_SnapshotAndMutations(t *testing.T) {
+	store := telemetry.NewStore()
+
+	// Verify initial default push telemetry state
+	snap := store.Snapshot()
+	if snap.Push.Enabled {
+		t.Errorf("expected snap.Push.Enabled to be false initially")
+	}
+	if snap.Push.TotalAttempts != 0 || snap.Push.TotalSuccesses != 0 || snap.Push.TotalFailures != 0 || snap.Push.TotalDropped != 0 {
+		t.Errorf("expected all push counters to be 0, got %+v", snap.Push)
+	}
+	if !snap.Push.LastPushAt.IsZero() {
+		t.Errorf("expected LastPushAt to be zero initially, got %v", snap.Push.LastPushAt)
+	}
+	if snap.Push.LastLatencyMs != 0 {
+		t.Errorf("expected LastLatencyMs to be 0, got %d", snap.Push.LastLatencyMs)
+	}
+	if snap.Push.LastError != "" {
+		t.Errorf("expected LastError to be empty, got %q", snap.Push.LastError)
+	}
+
+	// Enable push
+	store.SetPushEnabled(true)
+	snap = store.Snapshot()
+	if !snap.Push.Enabled {
+		t.Errorf("expected snap.Push.Enabled to be true after SetPushEnabled(true)")
+	}
+
+	// Record push attempt
+	store.RecordPushAttempt()
+	snap = store.Snapshot()
+	if snap.Push.TotalAttempts != 1 {
+		t.Errorf("expected TotalAttempts=1, got %d", snap.Push.TotalAttempts)
+	}
+
+	// Record push success
+	beforeSuccess := time.Now()
+	store.RecordPushResult(true, 42*time.Millisecond, nil)
+	snap = store.Snapshot()
+	if snap.Push.TotalSuccesses != 1 {
+		t.Errorf("expected TotalSuccesses=1, got %d", snap.Push.TotalSuccesses)
+	}
+	if snap.Push.TotalFailures != 0 {
+		t.Errorf("expected TotalFailures=0, got %d", snap.Push.TotalFailures)
+	}
+	if snap.Push.LastLatencyMs != 42 {
+		t.Errorf("expected LastLatencyMs=42, got %d", snap.Push.LastLatencyMs)
+	}
+	if snap.Push.LastPushAt.Before(beforeSuccess) {
+		t.Errorf("expected LastPushAt >= %v, got %v", beforeSuccess, snap.Push.LastPushAt)
+	}
+	if snap.Push.LastError != "" {
+		t.Errorf("expected LastError to be empty on success, got %q", snap.Push.LastError)
+	}
+
+	// Record push attempt and failure
+	store.RecordPushAttempt()
+	beforeFailure := time.Now()
+	pushErr := errors.New("connection reset by peer")
+	store.RecordPushResult(false, 150*time.Millisecond, pushErr)
+	snap = store.Snapshot()
+	if snap.Push.TotalAttempts != 2 {
+		t.Errorf("expected TotalAttempts=2, got %d", snap.Push.TotalAttempts)
+	}
+	if snap.Push.TotalSuccesses != 1 {
+		t.Errorf("expected TotalSuccesses=1, got %d", snap.Push.TotalSuccesses)
+	}
+	if snap.Push.TotalFailures != 1 {
+		t.Errorf("expected TotalFailures=1, got %d", snap.Push.TotalFailures)
+	}
+	if snap.Push.LastLatencyMs != 150 {
+		t.Errorf("expected LastLatencyMs=150, got %d", snap.Push.LastLatencyMs)
+	}
+	if snap.Push.LastPushAt.Before(beforeFailure) {
+		t.Errorf("expected LastPushAt >= %v, got %v", beforeFailure, snap.Push.LastPushAt)
+	}
+	if snap.Push.LastError != pushErr.Error() {
+		t.Errorf("expected LastError=%q, got %q", pushErr.Error(), snap.Push.LastError)
+	}
+
+	// Record push drop
+	store.RecordPushDrop()
+	snap = store.Snapshot()
+	if snap.Push.TotalDropped != 1 {
+		t.Errorf("expected TotalDropped=1, got %d", snap.Push.TotalDropped)
+	}
+
+	// Disable push
+	store.SetPushEnabled(false)
+	snap = store.Snapshot()
+	if snap.Push.Enabled {
+		t.Errorf("expected snap.Push.Enabled to be false after SetPushEnabled(false)")
+	}
+}
+
+func TestPushTelemetry_ConcurrentAccessWithRaceDetector(t *testing.T) {
+	store := telemetry.NewStore()
+
+	const numGoroutines = 20
+	const iterationsPerGoroutine = 50
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines * 4)
+
+	// Goroutines recording attempts and drops
+	for g := 0; g < numGoroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				store.RecordPushAttempt()
+				store.RecordPushDrop()
+			}
+		}()
+	}
+
+	// Goroutines recording results (successes and failures)
+	for g := 0; g < numGoroutines; g++ {
+		go func(gID int) {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				if (gID+i)%2 == 0 {
+					store.RecordPushResult(true, time.Duration(i)*time.Millisecond, nil)
+				} else {
+					store.RecordPushResult(false, time.Duration(i)*time.Millisecond, errors.New("err"))
+				}
+			}
+		}(g)
+	}
+
+	// Goroutines toggling enabled status
+	for g := 0; g < numGoroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				store.SetPushEnabled(i%2 == 0)
+			}
+		}()
+	}
+
+	// Goroutines taking snapshots
+	for g := 0; g < numGoroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				snap := store.Snapshot()
+				_ = snap.Push
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	finalSnap := store.Snapshot()
+	expectedAttempts := int64(numGoroutines * iterationsPerGoroutine)
+	if finalSnap.Push.TotalAttempts != expectedAttempts {
+		t.Errorf("expected TotalAttempts=%d, got %d", expectedAttempts, finalSnap.Push.TotalAttempts)
+	}
+	expectedDrops := int64(numGoroutines * iterationsPerGoroutine)
+	if finalSnap.Push.TotalDropped != expectedDrops {
+		t.Errorf("expected TotalDropped=%d, got %d", expectedDrops, finalSnap.Push.TotalDropped)
+	}
+	expectedResults := int64(numGoroutines * iterationsPerGoroutine)
+	if finalSnap.Push.TotalSuccesses+finalSnap.Push.TotalFailures != expectedResults {
+		t.Errorf("expected total results=%d, got %d", expectedResults, finalSnap.Push.TotalSuccesses+finalSnap.Push.TotalFailures)
+	}
+}
+
+
