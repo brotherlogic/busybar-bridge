@@ -6,13 +6,17 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/brotherlogic/busybar-bridge/internal/busybar"
+	"github.com/brotherlogic/busybar-bridge/internal/calendar"
 	"github.com/brotherlogic/busybar-bridge/internal/config"
 	"github.com/brotherlogic/busybar-bridge/internal/hass"
 	"github.com/brotherlogic/busybar-bridge/internal/runner"
@@ -332,6 +336,7 @@ func TestRunner_PipelineIntegrationAndGracefulShutdown(t *testing.T) {
 		Port:               serverPort,
 		ShutdownTimeout:    3 * time.Second,
 		LogLevel:           "info",
+		CalendarStorePath:  filepath.Join(t.TempDir(), "calendar.pb"),
 	}
 
 	r, err := runner.NewRunner(cfg)
@@ -606,3 +611,123 @@ func TestRunner_ShutdownTimeout(t *testing.T) {
 		t.Fatalf("Run() did not finish within expected bounds")
 	}
 }
+
+func TestNewRunner_CalendarStoreAndManager_Unconfigured(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "calendar.pb")
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.CalendarStorePath = storePath
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.CalendarStore() == nil {
+		t.Fatalf("expected non-nil CalendarStore on Runner")
+	}
+	if r.CalendarManager() != nil {
+		t.Fatalf("expected nil CalendarManager on Runner when unconfigured, got %v", r.CalendarManager())
+	}
+	if r.Server() == nil {
+		t.Fatalf("expected non-nil Server")
+	}
+	if r.Server().CalendarStore() == nil {
+		t.Fatalf("expected non-nil CalendarStore on Server")
+	}
+	if r.Server().OAuthManager() != nil {
+		t.Fatalf("expected nil OAuthManager on Server when unconfigured")
+	}
+}
+
+func TestNewRunner_CalendarStoreAndManager_Configured(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "calendar.pb")
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.CalendarStorePath = storePath
+	cfg.GoogleClientID = "client-id-123"
+	cfg.GoogleClientSecret = "client-secret-xyz"
+	cfg.GoogleRedirectURL = "http://localhost:8080/oauth/google/callback"
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.CalendarStore() == nil {
+		t.Fatalf("expected non-nil CalendarStore on Runner")
+	}
+	if r.CalendarManager() == nil {
+		t.Fatalf("expected non-nil CalendarManager on Runner when OAuth configured")
+	}
+	if !r.CalendarManager().IsConfigured() {
+		t.Errorf("expected CalendarManager to report configured")
+	}
+	if r.Server() == nil {
+		t.Fatalf("expected non-nil Server")
+	}
+	if r.Server().CalendarStore() == nil {
+		t.Fatalf("expected non-nil CalendarStore on Server")
+	}
+	if r.Server().OAuthManager() == nil {
+		t.Fatalf("expected non-nil OAuthManager on Server when OAuth configured")
+	}
+}
+
+func TestNewRunner_CalendarStoreInitError(t *testing.T) {
+	tempDir := t.TempDir()
+	corruptPath := filepath.Join(tempDir, "corrupt.pb")
+	if err := os.WriteFile(corruptPath, []byte("invalid-proto-payload"), 0600); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.CalendarStorePath = corruptPath
+
+	r, err := runner.NewRunner(cfg)
+	if err == nil {
+		t.Fatalf("expected error initializing runner with corrupt calendar store, got runner: %v", r)
+	}
+	if !strings.Contains(err.Error(), "calendar store") {
+		t.Fatalf("expected error message to mention 'calendar store', got: %v", err)
+	}
+}
+
+func TestNewRunner_CalendarOptions(t *testing.T) {
+	tempDir := t.TempDir()
+	customStore, err := calendar.NewStore(filepath.Join(tempDir, "custom.pb"))
+	if err != nil {
+		t.Fatalf("failed to create custom store: %v", err)
+	}
+	customMgr := calendar.NewManager(calendar.ManagerConfig{
+		ClientID:     "custom-client",
+		ClientSecret: "custom-secret",
+	})
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "token"
+
+	r, err := runner.NewRunner(cfg,
+		runner.WithCalendarStore(customStore),
+		runner.WithCalendarManager(customMgr),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.CalendarStore() != customStore {
+		t.Errorf("expected custom calendar store to be set on runner")
+	}
+	if r.CalendarManager() != customMgr {
+		t.Errorf("expected custom calendar manager to be set on runner")
+	}
+	if r.Server().CalendarStore() != customStore {
+		t.Errorf("expected server to receive custom calendar store")
+	}
+	if r.Server().OAuthManager() != customMgr {
+		t.Errorf("expected server to receive custom calendar manager")
+	}
+}
+

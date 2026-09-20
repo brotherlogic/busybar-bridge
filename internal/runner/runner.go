@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/brotherlogic/busybar-bridge/internal/busybar"
+	"github.com/brotherlogic/busybar-bridge/internal/calendar"
 	"github.com/brotherlogic/busybar-bridge/internal/config"
 	"github.com/brotherlogic/busybar-bridge/internal/hass"
 	"github.com/brotherlogic/busybar-bridge/internal/server"
@@ -19,12 +20,14 @@ import (
 // telemetry, Busy Bar ingestion, Protobuf decoding, Home Assistant dispatching,
 // and the HTTP observability server.
 type Runner struct {
-	cfg        *config.AppConfig
-	store      *telemetry.Store
-	busyClient *busybar.Client
-	decoder    *busybar.Decoder
-	hassClient *hass.Client
-	server     *server.Server
+	cfg           *config.AppConfig
+	store         *telemetry.Store
+	busyClient    *busybar.Client
+	decoder       *busybar.Decoder
+	hassClient    *hass.Client
+	server        *server.Server
+	calendarStore *calendar.Store
+	calendarMgr   *calendar.Manager
 
 	mu      sync.Mutex
 	running bool
@@ -68,6 +71,25 @@ func WithServer(srv *server.Server) Option {
 	}
 }
 
+// WithCalendarStore overrides the calendar store.
+func WithCalendarStore(store *calendar.Store) Option {
+	return func(r *Runner) {
+		r.calendarStore = store
+	}
+}
+
+// WithCalendarManager overrides the Google OAuth manager.
+func WithCalendarManager(mgr *calendar.Manager) Option {
+	return func(r *Runner) {
+		r.calendarMgr = mgr
+	}
+}
+
+// WithOAuthManager overrides the Google OAuth manager (alias for WithCalendarManager).
+func WithOAuthManager(mgr *calendar.Manager) Option {
+	return WithCalendarManager(mgr)
+}
+
 // NewRunner constructs and validates a new Runner instance with configured components.
 func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 	if cfg == nil {
@@ -75,6 +97,24 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid app config: %w", err)
+	}
+
+	calStorePath := cfg.CalendarStorePath
+	if calStorePath == "" {
+		calStorePath = config.DefaultConfig().CalendarStorePath
+	}
+	calStore, err := calendar.NewStore(calStorePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize calendar store: %w", err)
+	}
+
+	var calMgr *calendar.Manager
+	if cfg.IsOAuthConfigured() {
+		calMgr = calendar.NewManager(calendar.ManagerConfig{
+			ClientID:     cfg.GoogleClientID,
+			ClientSecret: cfg.GoogleClientSecret,
+			RedirectURL:  cfg.GoogleRedirectURL,
+		})
 	}
 
 	store := telemetry.NewStore()
@@ -96,21 +136,34 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 		return nil, fmt.Errorf("failed to initialize Home Assistant client: %w", err)
 	}
 
-	serverCfg := server.DefaultConfig()
-	serverCfg.Port = cfg.Port
-	srv := server.New(serverCfg, store)
-
 	r := &Runner{
-		cfg:        cfg,
-		store:      store,
-		busyClient: busyClient,
-		decoder:    decoder,
-		hassClient: hassClient,
-		server:     srv,
+		cfg:           cfg,
+		store:         store,
+		busyClient:    busyClient,
+		decoder:       decoder,
+		hassClient:    hassClient,
+		calendarStore: calStore,
+		calendarMgr:   calMgr,
 	}
 
 	for _, opt := range opts {
 		opt(r)
+	}
+
+	if r.server == nil {
+		serverCfg := server.DefaultConfig()
+		serverCfg.Port = cfg.Port
+
+		var serverOpts []server.ServerOption
+		if r.calendarStore != nil {
+			serverOpts = append(serverOpts, server.WithCalendarStore(r.calendarStore))
+		}
+		if r.calendarMgr != nil {
+			serverOpts = append(serverOpts, server.WithCalendarManager(r.calendarMgr))
+		}
+		serverOpts = append(serverOpts, server.WithOAuthConfigured(cfg.IsOAuthConfigured()))
+
+		r.server = server.NewServer(serverCfg, r.store, serverOpts...)
 	}
 
 	return r, nil
@@ -144,6 +197,21 @@ func (r *Runner) HassClient() *hass.Client {
 // Server returns the HTTP observability server.
 func (r *Runner) Server() *server.Server {
 	return r.server
+}
+
+// CalendarStore returns the calendar persistence store.
+func (r *Runner) CalendarStore() *calendar.Store {
+	return r.calendarStore
+}
+
+// CalendarManager returns the Google OAuth manager, or nil if not configured.
+func (r *Runner) CalendarManager() *calendar.Manager {
+	return r.calendarMgr
+}
+
+// OAuthManager returns the Google OAuth manager, or nil if not configured.
+func (r *Runner) OAuthManager() *calendar.Manager {
+	return r.calendarMgr
 }
 
 // TranslateEvent converts a normalized Protobuf event into a typed Home Assistant Event.
