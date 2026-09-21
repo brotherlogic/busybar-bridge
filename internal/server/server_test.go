@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -330,6 +331,169 @@ func TestStatusPage_TemplateError(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("expected status %d, got %d", http.StatusInternalServerError, rec.Code)
+	}
+}
+
+func TestStatusJSON_AcceptHeader(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetPushEnabled(true)
+	store.RecordPushAttempt()
+	store.RecordPushResult(true, 45*time.Millisecond, nil)
+	store.RecordPushAttempt()
+	store.RecordPushResult(false, 120*time.Millisecond, errors.New("network unreachable"))
+	store.RecordPushDrop()
+
+	srv := New(DefaultConfig(), store)
+
+	for _, path := range []string{"/status", "/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept", "application/json")
+		rec := httptest.NewRecorder()
+
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("path %s: expected status %d, got %d", path, http.StatusOK, rec.Code)
+		}
+
+		contentType := rec.Header().Get("Content-Type")
+		if !strings.Contains(contentType, "application/json") {
+			t.Errorf("path %s: expected Content-Type application/json, got %q", path, contentType)
+		}
+
+		var data StatusData
+		if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+			t.Fatalf("path %s: failed to decode JSON response: %v", path, err)
+		}
+
+		if !data.Push.Enabled {
+			t.Errorf("path %s: expected Push.Enabled=true, got %v", path, data.Push.Enabled)
+		}
+		if data.Push.TotalAttempts != 2 {
+			t.Errorf("path %s: expected Push.TotalAttempts=2, got %d", path, data.Push.TotalAttempts)
+		}
+		if data.Push.TotalSuccesses != 1 {
+			t.Errorf("path %s: expected Push.TotalSuccesses=1, got %d", path, data.Push.TotalSuccesses)
+		}
+		if data.Push.TotalFailures != 1 {
+			t.Errorf("path %s: expected Push.TotalFailures=1, got %d", path, data.Push.TotalFailures)
+		}
+		if data.Push.TotalDropped != 1 {
+			t.Errorf("path %s: expected Push.TotalDropped=1, got %d", path, data.Push.TotalDropped)
+		}
+		if data.Push.LastLatencyMs != 120 {
+			t.Errorf("path %s: expected Push.LastLatencyMs=120, got %d", path, data.Push.LastLatencyMs)
+		}
+		if data.Push.LastError != "network unreachable" {
+			t.Errorf("path %s: expected Push.LastError='network unreachable', got %q", path, data.Push.LastError)
+		}
+		if data.Push.LastPushAt.IsZero() {
+			t.Errorf("path %s: expected Push.LastPushAt to be non-zero", path)
+		}
+
+		var raw map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("path %s: failed to unmarshal raw map: %v", path, err)
+		}
+		pushRaw, exists := raw["Push"]
+		if !exists {
+			pushRaw, exists = raw["push"]
+		}
+		if !exists || pushRaw == nil {
+			t.Fatalf("path %s: expected push telemetry object in raw JSON payload, got keys: %v", path, raw)
+		}
+		pushMap, ok := pushRaw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("path %s: expected push field to be a map, got %T", path, pushRaw)
+		}
+		if enabled, _ := pushMap["enabled"].(bool); !enabled {
+			t.Errorf("path %s: expected raw push.enabled=true, got %v", path, pushMap["enabled"])
+		}
+		if attempts, _ := pushMap["total_attempts"].(float64); attempts != 2 {
+			t.Errorf("path %s: expected raw push.total_attempts=2, got %v", path, pushMap["total_attempts"])
+		}
+	}
+}
+
+func TestStatusJSON_QueryParamFormat(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetPushEnabled(true)
+	store.RecordPushAttempt()
+	store.RecordPushResult(true, 30*time.Millisecond, nil)
+
+	srv := New(DefaultConfig(), store)
+
+	for _, path := range []string{"/status?format=json", "/?format=json"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("path %s: expected status %d, got %d", path, http.StatusOK, rec.Code)
+		}
+
+		contentType := rec.Header().Get("Content-Type")
+		if !strings.Contains(contentType, "application/json") {
+			t.Errorf("path %s: expected Content-Type application/json, got %q", path, contentType)
+		}
+
+		var data StatusData
+		if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+			t.Fatalf("path %s: failed to decode JSON response: %v", path, err)
+		}
+
+		if !data.Push.Enabled {
+			t.Errorf("path %s: expected Push.Enabled=true, got %v", path, data.Push.Enabled)
+		}
+		if data.Push.TotalAttempts != 1 {
+			t.Errorf("path %s: expected Push.TotalAttempts=1, got %d", path, data.Push.TotalAttempts)
+		}
+		if data.Push.TotalSuccesses != 1 {
+			t.Errorf("path %s: expected Push.TotalSuccesses=1, got %d", path, data.Push.TotalSuccesses)
+		}
+
+		var raw map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("path %s: failed to decode raw JSON: %v", path, err)
+		}
+		pushRaw, exists := raw["Push"]
+		if !exists {
+			pushRaw, exists = raw["push"]
+		}
+		if !exists || pushRaw == nil {
+			t.Fatalf("path %s: expected push metrics in raw JSON, got %v", path, raw)
+		}
+	}
+}
+
+func TestStatusJSON_NilStore(t *testing.T) {
+	srv := New(DefaultConfig(), nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/status?format=json", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	contentType := rec.Header().Get("Content-Type")
+	if !strings.Contains(contentType, "application/json") {
+		t.Errorf("expected Content-Type application/json, got %q", contentType)
+	}
+
+	var data StatusData
+	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+		t.Fatalf("failed to decode JSON response with nil store: %v", err)
+	}
+
+	if data.Push.Enabled {
+		t.Errorf("expected Push.Enabled=false for nil store, got %v", data.Push.Enabled)
+	}
+	if data.Push.TotalAttempts != 0 {
+		t.Errorf("expected Push.TotalAttempts=0 for nil store, got %d", data.Push.TotalAttempts)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -387,14 +388,26 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		snapshot = s.store.Snapshot()
 	}
 
-	if s.tmpl == nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
 	data := StatusData{
 		Snapshot: snapshot,
 		Calendar: s.calendarStatus(r),
+	}
+
+	if strings.Contains(r.Header.Get("Accept"), "application/json") || r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		if err := json.NewEncoder(w).Encode(data); err != nil {
+			log.Printf("failed to encode status json: %v", err)
+		}
+		return
+	}
+
+	if s.tmpl == nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
 
 	var buf bytes.Buffer
