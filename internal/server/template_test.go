@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/brotherlogic/busybar-bridge/internal/telemetry"
 )
 
 // Mock data structures mirroring the telemetry snapshot schema
@@ -45,6 +47,7 @@ type mockSnapshot struct {
 	Connection   mockConnectionStatus
 	Counters     mockEventCounters
 	Forwarding   mockForwardingTelemetry
+	Push         telemetry.PushTelemetry
 	TotalEvents  int64
 	RecentEvents []mockEventTrace
 	Calendar     CalendarStatus
@@ -358,6 +361,122 @@ func TestStatusTemplate_FlashAlerts(t *testing.T) {
 	}
 	if !strings.Contains(renderedSuccess, "Google Calendar linked successfully") {
 		t.Errorf("expected FlashSuccess text to be rendered")
+	}
+}
+
+func TestStatusTemplate_PushActiveBadge(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	snapshot := mockSnapshot{
+		Push: telemetry.PushTelemetry{
+			Enabled: true,
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	if !strings.Contains(rendered, "Outbound Push Transport") {
+		t.Errorf("expected rendered HTML to contain 'Outbound Push Transport'")
+	}
+	if !strings.Contains(rendered, `<span class="badge badge-success">ACTIVE</span>`) {
+		t.Errorf("expected rendered HTML to contain '<span class=\"badge badge-success\">ACTIVE</span>'")
+	}
+	if strings.Contains(rendered, "DISABLED (OPT-IN)") {
+		t.Errorf("did not expect 'DISABLED (OPT-IN)' when push is enabled")
+	}
+}
+
+func TestStatusTemplate_PushDisabledBadge(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	snapshot := mockSnapshot{
+		Push: telemetry.PushTelemetry{
+			Enabled: false,
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	if !strings.Contains(rendered, "Outbound Push Transport") {
+		t.Errorf("expected rendered HTML to contain 'Outbound Push Transport'")
+	}
+	if !strings.Contains(rendered, `<span class="badge badge-neutral">DISABLED (OPT-IN)</span>`) {
+		t.Errorf("expected rendered HTML to contain '<span class=\"badge badge-neutral\">DISABLED (OPT-IN)</span>'")
+	}
+	if strings.Contains(rendered, ">ACTIVE</span>") {
+		t.Errorf("did not expect 'ACTIVE' badge when push is disabled")
+	}
+}
+
+func TestStatusTemplate_PushCountersAndErrorBanner(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	snapshot := mockSnapshot{
+		Push: telemetry.PushTelemetry{
+			Enabled:        true,
+			TotalAttempts:  150,
+			TotalSuccesses: 140,
+			TotalFailures:  7,
+			TotalDropped:   3,
+			LastError:      "connection refused: 192.168.1.50:80",
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	// Counters and labels
+	for _, label := range []string{"Total Attempts", "Delivered", "Failed", "Superseded / Dropped"} {
+		if !strings.Contains(rendered, label) {
+			t.Errorf("expected rendered HTML to contain label %q", label)
+		}
+	}
+
+	// Counter values with their respective styling classes
+	if !strings.Contains(rendered, "150") {
+		t.Errorf("expected rendered HTML to contain Total Attempts value '150'")
+	}
+	if !strings.Contains(rendered, "140") || !strings.Contains(rendered, "text-success") {
+		t.Errorf("expected Delivered value '140' with 'text-success' class")
+	}
+	if !strings.Contains(rendered, "7") || !strings.Contains(rendered, "text-danger") {
+		t.Errorf("expected Failed value '7' with 'text-danger' class")
+	}
+	if !strings.Contains(rendered, "3") || !strings.Contains(rendered, "text-warning") {
+		t.Errorf("expected Superseded / Dropped value '3' with 'text-warning' class")
+	}
+
+	// Error banner
+	expectedBanner := `<div class="error-banner">Last Error: connection refused: 192.168.1.50:80</div>`
+	if !strings.Contains(rendered, expectedBanner) {
+		t.Errorf("expected error banner %q in rendered HTML", expectedBanner)
+	}
+}
+
+func TestStatusTemplate_PushErrorBanner_OmittedWhenEmpty(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	snapshot := mockSnapshot{
+		Push: telemetry.PushTelemetry{
+			Enabled:        true,
+			TotalAttempts:  20,
+			TotalSuccesses: 20,
+			TotalFailures:  0,
+			TotalDropped:   0,
+			LastError:      "",
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	if strings.Contains(rendered, `<div class="error-banner">`) || strings.Contains(rendered, "Last Error:") {
+		t.Errorf("error banner should not be rendered when LastError is empty")
+	}
+}
+
+func TestStatusTemplate_PushCSSClassesPresent(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+	rendered := renderTemplate(t, tmpl, mockSnapshot{})
+
+	for _, class := range []string{"badge-neutral", "text-success", "text-danger", "text-warning", "error-banner"} {
+		if !strings.Contains(rendered, "."+class) {
+			t.Errorf("expected CSS stylesheet to define class %q", "."+class)
+		}
 	}
 }
 
