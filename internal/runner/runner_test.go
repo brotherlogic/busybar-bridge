@@ -337,6 +337,7 @@ func TestRunner_PipelineIntegrationAndGracefulShutdown(t *testing.T) {
 		ShutdownTimeout:    3 * time.Second,
 		LogLevel:           "info",
 		CalendarStorePath:  filepath.Join(t.TempDir(), "calendar.pb"),
+		PushTimeout:        3 * time.Second,
 	}
 
 	r, err := runner.NewRunner(cfg)

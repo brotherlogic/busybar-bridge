@@ -27,6 +27,8 @@ var (
 	ErrInvalidShutdownTimeout = errors.New("shutdown_timeout must be positive")
 	// ErrInvalidGoogleRedirectURL indicates the Google OAuth redirect URL is invalid.
 	ErrInvalidGoogleRedirectURL = errors.New("invalid google_redirect_url: must be a valid http or https URL")
+	// ErrInvalidPushTimeout indicates the outbound push request timeout is not positive.
+	ErrInvalidPushTimeout = errors.New("push_timeout must be positive")
 )
 
 // AppConfig defines application configuration parameters.
@@ -46,6 +48,9 @@ type AppConfig struct {
 	GoogleClientSecret string
 	GoogleRedirectURL  string
 	CalendarStorePath  string
+	EnableOutboundPush bool
+	BusyBarAPIKey      string
+	PushTimeout        time.Duration
 }
 
 // DefaultConfig returns a new AppConfig populated with default values.
@@ -66,6 +71,9 @@ func DefaultConfig() *AppConfig {
 		GoogleClientSecret: "",
 		GoogleRedirectURL:  "http://localhost:8080/oauth/google/callback",
 		CalendarStorePath:  "/data/calendar_binding.pb",
+		EnableOutboundPush: false,
+		BusyBarAPIKey:      "",
+		PushTimeout:        3 * time.Second,
 	}
 }
 
@@ -120,6 +128,9 @@ func (c *AppConfig) Validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return ErrInvalidShutdownTimeout
+	}
+	if c.PushTimeout <= 0 {
+		return ErrInvalidPushTimeout
 	}
 
 	return nil
@@ -197,6 +208,23 @@ func Parse(args []string) (*AppConfig, error) {
 	if v := os.Getenv("CALENDAR_STORE_PATH"); v != "" {
 		cfg.CalendarStorePath = v
 	}
+	if v := os.Getenv("ENABLE_OUTBOUND_PUSH"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ENABLE_OUTBOUND_PUSH: %w", err)
+		}
+		cfg.EnableOutboundPush = b
+	}
+	if v := os.Getenv("BUSYBAR_API_KEY"); v != "" {
+		cfg.BusyBarAPIKey = v
+	}
+	if v := os.Getenv("PUSH_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PUSH_TIMEOUT: %w", err)
+		}
+		cfg.PushTimeout = d
+	}
 
 	// Parse CLI flags
 	fs := flag.NewFlagSet("busybar-bridge", flag.ContinueOnError)
@@ -231,6 +259,12 @@ func Parse(args []string) (*AppConfig, error) {
 	fs.StringVar(&cfg.GoogleRedirectURL, "google_redirect_url", cfg.GoogleRedirectURL, "Google OAuth redirect URL (alias)")
 	fs.StringVar(&cfg.CalendarStorePath, "calendar-store-path", cfg.CalendarStorePath, "Calendar binding persistence store path")
 	fs.StringVar(&cfg.CalendarStorePath, "calendar_store_path", cfg.CalendarStorePath, "Calendar binding persistence store path (alias)")
+	fs.BoolVar(&cfg.EnableOutboundPush, "enable-outbound-push", cfg.EnableOutboundPush, "Enable outbound push to BusyBar")
+	fs.BoolVar(&cfg.EnableOutboundPush, "enable_outbound_push", cfg.EnableOutboundPush, "Enable outbound push to BusyBar (alias)")
+	fs.StringVar(&cfg.BusyBarAPIKey, "busybar-api-key", cfg.BusyBarAPIKey, "BusyBar outbound push API key")
+	fs.StringVar(&cfg.BusyBarAPIKey, "busybar_api_key", cfg.BusyBarAPIKey, "BusyBar outbound push API key (alias)")
+	fs.DurationVar(&cfg.PushTimeout, "push-timeout", cfg.PushTimeout, "BusyBar outbound push HTTP timeout")
+	fs.DurationVar(&cfg.PushTimeout, "push_timeout", cfg.PushTimeout, "BusyBar outbound push HTTP timeout (alias)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
