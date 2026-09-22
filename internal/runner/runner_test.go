@@ -3,6 +3,7 @@ package runner_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -729,6 +730,202 @@ func TestNewRunner_CalendarOptions(t *testing.T) {
 	}
 	if r.Server().OAuthManager() != customMgr {
 		t.Errorf("expected server to receive custom calendar manager")
+	}
+}
+
+type mockPushClient struct {
+	started    atomic.Bool
+	closed     atomic.Bool
+	startErr   error
+	closeErr   error
+	cfg        busybar.PushConfig
+	pushedChan chan *busybar.Frame
+}
+
+func newMockPushClient(cfg busybar.PushConfig) *mockPushClient {
+	return &mockPushClient{
+		cfg:        cfg,
+		pushedChan: make(chan *busybar.Frame, 10),
+	}
+}
+
+func (m *mockPushClient) PushFrame(ctx context.Context, frame *busybar.Frame) error {
+	select {
+	case m.pushedChan <- frame:
+	default:
+	}
+	return nil
+}
+
+func (m *mockPushClient) Start(ctx context.Context) error {
+	if m.startErr != nil {
+		return m.startErr
+	}
+	m.started.Store(true)
+	return nil
+}
+
+func (m *mockPushClient) Close() error {
+	m.closed.Store(true)
+	return m.closeErr
+}
+
+func (m *mockPushClient) Config() busybar.PushConfig {
+	return m.cfg
+}
+
+func TestNewRunner_PushClient_DefaultsAndDisabled(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.PushClient() == nil {
+		t.Fatalf("expected non-nil PushClient on Runner")
+	}
+	if r.PushClient().Config().Enabled {
+		t.Errorf("expected push client to be disabled by default")
+	}
+	snap := r.Store().Snapshot()
+	if snap.Push.Enabled {
+		t.Errorf("expected telemetry store push enabled to be false by default")
+	}
+}
+
+func TestNewRunner_PushClient_Enabled(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.EnableOutboundPush = true
+	cfg.BusyBarHost = "192.168.1.100"
+	cfg.BusyBarPort = 8089
+	cfg.BusyBarAPIKey = "test-api-key"
+	cfg.PushTimeout = 4 * time.Second
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.PushClient() == nil {
+		t.Fatalf("expected non-nil PushClient on Runner")
+	}
+	pushCfg := r.PushClient().Config()
+	if !pushCfg.Enabled {
+		t.Errorf("expected push client to be enabled")
+	}
+	if pushCfg.Host != "192.168.1.100" {
+		t.Errorf("expected host 192.168.1.100, got %s", pushCfg.Host)
+	}
+	if pushCfg.Port != 8089 {
+		t.Errorf("expected port 8089, got %d", pushCfg.Port)
+	}
+	if pushCfg.APIKey != "test-api-key" {
+		t.Errorf("expected api key test-api-key, got %s", pushCfg.APIKey)
+	}
+	if pushCfg.Timeout != 4*time.Second {
+		t.Errorf("expected timeout 4s, got %v", pushCfg.Timeout)
+	}
+
+	snap := r.Store().Snapshot()
+	if !snap.Push.Enabled {
+		t.Errorf("expected telemetry store push enabled to be true")
+	}
+}
+
+func TestNewRunner_WithPushClient_Option(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+
+	mockClient := newMockPushClient(busybar.PushConfig{Enabled: true})
+
+	r, err := runner.NewRunner(cfg, runner.WithPushClient(mockClient))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.PushClient() != mockClient {
+		t.Errorf("expected custom PushClient to be set on Runner")
+	}
+}
+
+func TestRunner_PushClient_LifecycleAndGracefulShutdown(t *testing.T) {
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(freeLn.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	_ = freeLn.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "token"
+	cfg.Port = port
+	cfg.ShutdownTimeout = 500 * time.Millisecond
+
+	mockClient := newMockPushClient(busybar.PushConfig{Enabled: true})
+
+	r, err := runner.NewRunner(cfg, runner.WithPushClient(mockClient))
+	if err != nil {
+		t.Fatalf("failed to create runner: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- r.Run(ctx)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if !mockClient.started.Load() {
+		t.Errorf("expected push client to be started during Run()")
+	}
+
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("expected clean shutdown, got %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Run() did not finish within expected bounds")
+	}
+
+	if !mockClient.closed.Load() {
+		t.Errorf("expected push client to be closed during graceful shutdown")
+	}
+}
+
+func TestRunner_PushClient_StartError(t *testing.T) {
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(freeLn.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	_ = freeLn.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "token"
+	cfg.Port = port
+
+	mockClient := newMockPushClient(busybar.PushConfig{Enabled: true})
+	mockClient.startErr = errors.New("simulated push client start error")
+
+	r, err := runner.NewRunner(cfg, runner.WithPushClient(mockClient))
+	if err != nil {
+		t.Fatalf("failed to create runner: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = r.Run(ctx)
+	if err == nil {
+		t.Fatalf("expected error from Run() when push client fails to start, got nil")
+	}
+	if !strings.Contains(err.Error(), "outbound push client") {
+		t.Errorf("expected error message to mention 'outbound push client', got %v", err)
 	}
 }
 

@@ -28,6 +28,7 @@ type Runner struct {
 	server        *server.Server
 	calendarStore *calendar.Store
 	calendarMgr   *calendar.Manager
+	pushClient    busybar.PushClient
 
 	mu      sync.Mutex
 	running bool
@@ -90,6 +91,13 @@ func WithOAuthManager(mgr *calendar.Manager) Option {
 	return WithCalendarManager(mgr)
 }
 
+// WithPushClient overrides the BusyBar push client.
+func WithPushClient(client busybar.PushClient) Option {
+	return func(r *Runner) {
+		r.pushClient = client
+	}
+}
+
 // NewRunner constructs and validates a new Runner instance with configured components.
 func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 	if cfg == nil {
@@ -118,6 +126,7 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 	}
 
 	store := telemetry.NewStore()
+	store.SetPushEnabled(cfg.EnableOutboundPush)
 
 	busyCfg := busybar.DefaultConfig()
 	busyCfg.Host = cfg.BusyBarHost
@@ -148,6 +157,20 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 
 	for _, opt := range opts {
 		opt(r)
+	}
+
+	r.store.SetPushEnabled(cfg.EnableOutboundPush)
+
+	if r.pushClient == nil {
+		pushCfg := busybar.DefaultPushConfig()
+		pushCfg.Enabled = cfg.EnableOutboundPush
+		pushCfg.Host = cfg.BusyBarHost
+		pushCfg.Port = cfg.BusyBarPort
+		pushCfg.APIKey = cfg.BusyBarAPIKey
+		if cfg.PushTimeout > 0 {
+			pushCfg.Timeout = cfg.PushTimeout
+		}
+		r.pushClient = busybar.NewPushClient(pushCfg, r.store)
 	}
 
 	if r.server == nil {
@@ -212,6 +235,11 @@ func (r *Runner) CalendarManager() *calendar.Manager {
 // OAuthManager returns the Google OAuth manager, or nil if not configured.
 func (r *Runner) OAuthManager() *calendar.Manager {
 	return r.calendarMgr
+}
+
+// PushClient returns the BusyBar outbound push client.
+func (r *Runner) PushClient() busybar.PushClient {
+	return r.pushClient
 }
 
 // TranslateEvent converts a normalized Protobuf event into a typed Home Assistant Event.
@@ -360,6 +388,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	// 4. Start Busy Bar outbound push client
+	if r.pushClient != nil {
+		if err := r.pushClient.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start outbound push client: %w", err)
+		}
+	}
+
 	// Periodically sync connection state from client to telemetry store
 	syncCtx, syncCancel := context.WithCancel(ctx)
 	defer syncCancel()
@@ -426,7 +461,7 @@ frameLoop:
 		}
 	}
 
-	// Step 2: Flush queued events through Home Assistant dispatcher bounded by ShutdownTimeout
+	// Step 2: Flush queued events through Home Assistant dispatcher and close push client bounded by ShutdownTimeout
 	shutdownTimeout := r.cfg.ShutdownTimeout
 	if shutdownTimeout <= 0 {
 		shutdownTimeout = 10 * time.Second
@@ -434,17 +469,30 @@ frameLoop:
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
-	hassClosed := make(chan error, 1)
+	var shutdownWg sync.WaitGroup
+	if r.hassClient != nil {
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			_ = r.hassClient.Close()
+		}()
+	}
+	if r.pushClient != nil {
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			_ = r.pushClient.Close()
+		}()
+	}
+
+	clientsClosed := make(chan struct{})
 	go func() {
-		if r.hassClient != nil {
-			hassClosed <- r.hassClient.Close()
-		} else {
-			hassClosed <- nil
-		}
+		shutdownWg.Wait()
+		close(clientsClosed)
 	}()
 
 	select {
-	case <-hassClosed:
+	case <-clientsClosed:
 	case <-shutdownCtx.Done():
 	}
 
@@ -454,6 +502,97 @@ frameLoop:
 	}
 
 	// Step 4: Clean return on normal shutdown
+	return nil
+}
+
+// Close gracefully closes Runner clients and components.
+func (r *Runner) Close() error {
+	var errs []error
+	if r.busyClient != nil {
+		if err := r.busyClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if r.pushClient != nil {
+		if err := r.pushClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if r.hassClient != nil {
+		if err := r.hassClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+// Shutdown coordinates the graceful shutdown of the runner's components within the provided context.
+func (r *Runner) Shutdown(ctx context.Context) error {
+	shutdownTimeout := r.cfg.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 10 * time.Second
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, shutdownTimeout)
+	defer shutdownCancel()
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []error
+
+	if r.pushClient != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.pushClient.Close(); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
+	}
+
+	if r.hassClient != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.hassClient.Close(); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
+	}
+
+	if r.server != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.server.Shutdown(shutdownCtx); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
+	}
+
+	clientsClosed := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(clientsClosed)
+	}()
+
+	select {
+	case <-clientsClosed:
+	case <-shutdownCtx.Done():
+		return shutdownCtx.Err()
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }
 
