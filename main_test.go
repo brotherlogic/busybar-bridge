@@ -235,3 +235,27 @@ func TestRun_WithGoogleOAuthAndCalendarFlags(t *testing.T) {
 	}
 }
 
+func TestRun_WithOutboundPushFlags(t *testing.T) {
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	args := []string{
+		"--hass-token=test-token-12345",
+		"--port=19097",
+		"--busybar-port=19098",
+		"--shutdown-timeout=500ms",
+		"--enable-outbound-push=true",
+		"--busybar-api-key=test-api-key-123",
+		"--push-timeout=2s",
+	}
+
+	code := run(ctx, args, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 on graceful shutdown with outbound push flags, got %d. stderr: %s", code, stderr.String())
+	}
+}
+
