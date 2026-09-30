@@ -492,4 +492,163 @@ func TestPushTelemetry_ConcurrentAccessWithRaceDetector(t *testing.T) {
 	}
 }
 
+func TestCalendarSyncTelemetry_SnapshotAndMutations(t *testing.T) {
+	store := telemetry.NewStore()
+
+	// Verify initial default calendar sync telemetry state
+	snap := store.Snapshot()
+	if snap.CalendarSync.Enabled {
+		t.Errorf("expected snap.CalendarSync.Enabled to be false initially")
+	}
+	if snap.CalendarSync.TotalPolls != 0 || snap.CalendarSync.SuccessPolls != 0 || snap.CalendarSync.FailedPolls != 0 {
+		t.Errorf("expected all calendar sync poll counters to be 0 initially, got %+v", snap.CalendarSync)
+	}
+	if !snap.CalendarSync.LastPollAt.IsZero() {
+		t.Errorf("expected LastPollAt to be zero initially, got %v", snap.CalendarSync.LastPollAt)
+	}
+	if snap.CalendarSync.LastError != "" {
+		t.Errorf("expected LastError to be empty initially, got %q", snap.CalendarSync.LastError)
+	}
+	if snap.CalendarSync.ActiveSummary != "" {
+		t.Errorf("expected ActiveSummary to be empty initially, got %q", snap.CalendarSync.ActiveSummary)
+	}
+
+	// Enable calendar sync
+	store.SetCalendarSyncEnabled(true)
+	snap = store.Snapshot()
+	if !snap.CalendarSync.Enabled {
+		t.Errorf("expected snap.CalendarSync.Enabled to be true after SetCalendarSyncEnabled(true)")
+	}
+
+	// Record successful calendar poll with active meeting
+	beforeSuccess := time.Now()
+	store.RecordCalendarPoll(true, "Team Standup", nil)
+	snap = store.Snapshot()
+	if snap.CalendarSync.TotalPolls != 1 {
+		t.Errorf("expected TotalPolls=1, got %d", snap.CalendarSync.TotalPolls)
+	}
+	if snap.CalendarSync.SuccessPolls != 1 {
+		t.Errorf("expected SuccessPolls=1, got %d", snap.CalendarSync.SuccessPolls)
+	}
+	if snap.CalendarSync.FailedPolls != 0 {
+		t.Errorf("expected FailedPolls=0, got %d", snap.CalendarSync.FailedPolls)
+	}
+	if snap.CalendarSync.LastPollAt.Before(beforeSuccess) {
+		t.Errorf("expected LastPollAt >= %v, got %v", beforeSuccess, snap.CalendarSync.LastPollAt)
+	}
+	if snap.CalendarSync.ActiveSummary != "Team Standup" {
+		t.Errorf("expected ActiveSummary='Team Standup', got %q", snap.CalendarSync.ActiveSummary)
+	}
+	if snap.CalendarSync.LastError != "" {
+		t.Errorf("expected LastError to be empty on success, got %q", snap.CalendarSync.LastError)
+	}
+
+	// Record failed calendar poll with retained active summary and error
+	beforeFailure := time.Now()
+	pollErr := errors.New("google calendar api 503 service unavailable")
+	store.RecordCalendarPoll(false, "Team Standup", pollErr)
+	snap = store.Snapshot()
+	if snap.CalendarSync.TotalPolls != 2 {
+		t.Errorf("expected TotalPolls=2, got %d", snap.CalendarSync.TotalPolls)
+	}
+	if snap.CalendarSync.SuccessPolls != 1 {
+		t.Errorf("expected SuccessPolls=1, got %d", snap.CalendarSync.SuccessPolls)
+	}
+	if snap.CalendarSync.FailedPolls != 1 {
+		t.Errorf("expected FailedPolls=1, got %d", snap.CalendarSync.FailedPolls)
+	}
+	if snap.CalendarSync.LastPollAt.Before(beforeFailure) {
+		t.Errorf("expected LastPollAt >= %v, got %v", beforeFailure, snap.CalendarSync.LastPollAt)
+	}
+	if snap.CalendarSync.ActiveSummary != "Team Standup" {
+		t.Errorf("expected ActiveSummary='Team Standup' retained during outage, got %q", snap.CalendarSync.ActiveSummary)
+	}
+	if snap.CalendarSync.LastError != pollErr.Error() {
+		t.Errorf("expected LastError=%q, got %q", pollErr.Error(), snap.CalendarSync.LastError)
+	}
+
+	// Record successful poll when no event is active (idle), clearing error and summary
+	store.RecordCalendarPoll(true, "", nil)
+	snap = store.Snapshot()
+	if snap.CalendarSync.TotalPolls != 3 {
+		t.Errorf("expected TotalPolls=3, got %d", snap.CalendarSync.TotalPolls)
+	}
+	if snap.CalendarSync.SuccessPolls != 2 {
+		t.Errorf("expected SuccessPolls=2, got %d", snap.CalendarSync.SuccessPolls)
+	}
+	if snap.CalendarSync.FailedPolls != 1 {
+		t.Errorf("expected FailedPolls=1, got %d", snap.CalendarSync.FailedPolls)
+	}
+	if snap.CalendarSync.ActiveSummary != "" {
+		t.Errorf("expected ActiveSummary to be empty when idle, got %q", snap.CalendarSync.ActiveSummary)
+	}
+	if snap.CalendarSync.LastError != "" {
+		t.Errorf("expected LastError to be cleared on successful poll, got %q", snap.CalendarSync.LastError)
+	}
+
+	// Disable calendar sync
+	store.SetCalendarSyncEnabled(false)
+	snap = store.Snapshot()
+	if snap.CalendarSync.Enabled {
+		t.Errorf("expected snap.CalendarSync.Enabled to be false after SetCalendarSyncEnabled(false)")
+	}
+}
+
+func TestCalendarSyncTelemetry_ConcurrentAccessWithRaceDetector(t *testing.T) {
+	store := telemetry.NewStore()
+
+	const numGoroutines = 20
+	const iterationsPerGoroutine = 50
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines * 3)
+
+	// Goroutines recording poll outcomes
+	for g := 0; g < numGoroutines; g++ {
+		go func(gID int) {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				if (gID+i)%2 == 0 {
+					store.RecordCalendarPoll(true, fmt.Sprintf("Meeting-%d", i), nil)
+				} else {
+					store.RecordCalendarPoll(false, fmt.Sprintf("Meeting-%d", i), errors.New("timeout"))
+				}
+			}
+		}(g)
+	}
+
+	// Goroutines toggling enabled state
+	for g := 0; g < numGoroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				store.SetCalendarSyncEnabled(i%2 == 0)
+			}
+		}()
+	}
+
+	// Goroutines taking snapshots
+	for g := 0; g < numGoroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterationsPerGoroutine; i++ {
+				snap := store.Snapshot()
+				_ = snap.CalendarSync
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	finalSnap := store.Snapshot()
+	expectedPolls := int64(numGoroutines * iterationsPerGoroutine)
+	if finalSnap.CalendarSync.TotalPolls != expectedPolls {
+		t.Errorf("expected TotalPolls=%d, got %d", expectedPolls, finalSnap.CalendarSync.TotalPolls)
+	}
+	if finalSnap.CalendarSync.SuccessPolls+finalSnap.CalendarSync.FailedPolls != expectedPolls {
+		t.Errorf("expected SuccessPolls + FailedPolls = %d, got %d", expectedPolls, finalSnap.CalendarSync.SuccessPolls+finalSnap.CalendarSync.FailedPolls)
+	}
+}
+
+
 

@@ -50,6 +50,17 @@ type PushTelemetry struct {
 	LastError      string    `json:"last_error,omitempty"`
 }
 
+// CalendarSyncTelemetry tracks cumulative metrics and active state for Google Calendar polling.
+type CalendarSyncTelemetry struct {
+	Enabled       bool      `json:"enabled"`
+	TotalPolls    int64     `json:"total_polls"`
+	SuccessPolls  int64     `json:"success_polls"`
+	FailedPolls   int64     `json:"failed_polls"`
+	LastPollAt    time.Time `json:"last_poll_at,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	ActiveSummary string    `json:"active_summary,omitempty"`
+}
+
 // EventTrace captures point-in-time diagnostic information for an individual event.
 type EventTrace struct {
 	ID        int64             `json:"id"`
@@ -69,6 +80,7 @@ type Snapshot struct {
 	Counters     EventCounters
 	Forwarding   ForwardingTelemetry
 	Push         PushTelemetry
+	CalendarSync CalendarSyncTelemetry
 	TotalEvents  int64
 	RecentEvents []EventTrace // Oldest to newest (up to 10)
 }
@@ -81,6 +93,7 @@ type Store struct {
 	counters        EventCounters
 	forwarding      ForwardingTelemetry
 	push            PushTelemetry
+	calendarSync    CalendarSyncTelemetry
 	ringBuffer      []EventTrace
 	nextID          int64
 	totalEvents     int64
@@ -204,6 +217,7 @@ func (s *Store) Snapshot() Snapshot {
 		Counters:     s.counters,
 		Forwarding:   s.forwarding,
 		Push:         s.push,
+		CalendarSync: s.calendarSync,
 		TotalEvents:  s.totalEvents,
 		RecentEvents: recent,
 	}
@@ -265,4 +279,33 @@ func (s *Store) DropCount() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.dropCount
+}
+
+// SetCalendarSyncEnabled sets whether calendar synchronization is currently enabled.
+func (s *Store) SetCalendarSyncEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.calendarSync.Enabled = enabled
+}
+
+// RecordCalendarPoll records a calendar polling attempt, updating total attempts,
+// successes or failures, the last poll timestamp, active event summary, and any error encountered.
+func (s *Store) RecordCalendarPoll(success bool, activeSummary string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.calendarSync.TotalPolls++
+	s.calendarSync.LastPollAt = time.Now()
+	s.calendarSync.ActiveSummary = activeSummary
+
+	if success {
+		s.calendarSync.SuccessPolls++
+		s.calendarSync.LastError = ""
+	} else {
+		s.calendarSync.FailedPolls++
+		if err != nil {
+			s.calendarSync.LastError = err.Error()
+		}
+	}
 }
