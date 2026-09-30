@@ -63,6 +63,12 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.PushTimeout != 3*time.Second {
 		t.Errorf("expected PushTimeout 3s, got %v", cfg.PushTimeout)
 	}
+	if cfg.EnableCalendarSync != false {
+		t.Errorf("expected EnableCalendarSync false, got %v", cfg.EnableCalendarSync)
+	}
+	if cfg.CalendarPollInterval != 1*time.Minute {
+		t.Errorf("expected CalendarPollInterval 1m, got %v", cfg.CalendarPollInterval)
+	}
 }
 
 func TestParse_DefaultsWithToken(t *testing.T) {
@@ -125,6 +131,12 @@ func TestParse_DefaultsWithToken(t *testing.T) {
 	if cfg.PushTimeout != 3*time.Second {
 		t.Errorf("expected default PushTimeout 3s, got %v", cfg.PushTimeout)
 	}
+	if cfg.EnableCalendarSync != false {
+		t.Errorf("expected default EnableCalendarSync false, got %v", cfg.EnableCalendarSync)
+	}
+	if cfg.CalendarPollInterval != 1*time.Minute {
+		t.Errorf("expected default CalendarPollInterval 1m, got %v", cfg.CalendarPollInterval)
+	}
 }
 
 func TestParse_EnvironmentVariables(t *testing.T) {
@@ -146,6 +158,8 @@ func TestParse_EnvironmentVariables(t *testing.T) {
 	t.Setenv("ENABLE_OUTBOUND_PUSH", "true")
 	t.Setenv("BUSYBAR_API_KEY", "env-secret-api-key")
 	t.Setenv("PUSH_TIMEOUT", "8s")
+	t.Setenv("ENABLE_CALENDAR_SYNC", "true")
+	t.Setenv("CALENDAR_POLL_INTERVAL", "2m")
 
 	cfg, err := Parse(nil)
 	if err != nil {
@@ -206,6 +220,12 @@ func TestParse_EnvironmentVariables(t *testing.T) {
 	if cfg.PushTimeout != 8*time.Second {
 		t.Errorf("expected PushTimeout 8s, got %v", cfg.PushTimeout)
 	}
+	if cfg.EnableCalendarSync != true {
+		t.Errorf("expected EnableCalendarSync true, got %v", cfg.EnableCalendarSync)
+	}
+	if cfg.CalendarPollInterval != 2*time.Minute {
+		t.Errorf("expected CalendarPollInterval 2m, got %v", cfg.CalendarPollInterval)
+	}
 }
 
 func TestParse_CLIOverridePrecedence(t *testing.T) {
@@ -228,6 +248,8 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 	t.Setenv("ENABLE_OUTBOUND_PUSH", "false")
 	t.Setenv("BUSYBAR_API_KEY", "env-api-key")
 	t.Setenv("PUSH_TIMEOUT", "10s")
+	t.Setenv("ENABLE_CALENDAR_SYNC", "false")
+	t.Setenv("CALENDAR_POLL_INTERVAL", "10m")
 
 	// Pass CLI args to override everything
 	args := []string{
@@ -249,6 +271,8 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 		"-enable-outbound-push=true",
 		"-busybar-api-key", "cli-api-key",
 		"-push-timeout", "4s",
+		"-enable-calendar-sync=true",
+		"-calendar-poll-interval", "30s",
 	}
 
 	cfg, err := Parse(args)
@@ -310,6 +334,12 @@ func TestParse_CLIOverridePrecedence(t *testing.T) {
 	if cfg.PushTimeout != 4*time.Second {
 		t.Errorf("expected PushTimeout 4s from CLI, got %v", cfg.PushTimeout)
 	}
+	if cfg.EnableCalendarSync != true {
+		t.Errorf("expected EnableCalendarSync true from CLI, got %v", cfg.EnableCalendarSync)
+	}
+	if cfg.CalendarPollInterval != 30*time.Second {
+		t.Errorf("expected CalendarPollInterval 30s from CLI, got %v", cfg.CalendarPollInterval)
+	}
 }
 
 func TestParse_UnderscoreFlags(t *testing.T) {
@@ -331,6 +361,8 @@ func TestParse_UnderscoreFlags(t *testing.T) {
 		"-enable_outbound_push=true",
 		"-busybar_api_key", "under-push-key",
 		"-push_timeout", "8s",
+		"-enable_calendar_sync=true",
+		"-calendar_poll_interval", "45s",
 	}
 
 	cfg, err := Parse(args)
@@ -389,6 +421,12 @@ func TestParse_UnderscoreFlags(t *testing.T) {
 	if cfg.PushTimeout != 8*time.Second {
 		t.Errorf("expected PushTimeout 8s from CLI alias, got %v", cfg.PushTimeout)
 	}
+	if cfg.EnableCalendarSync != true {
+		t.Errorf("expected EnableCalendarSync true from CLI alias, got %v", cfg.EnableCalendarSync)
+	}
+	if cfg.CalendarPollInterval != 45*time.Second {
+		t.Errorf("expected CalendarPollInterval 45s from CLI alias, got %v", cfg.CalendarPollInterval)
+	}
 }
 
 func TestParse_InvalidEnvVars(t *testing.T) {
@@ -439,6 +477,18 @@ func TestParse_InvalidEnvVars(t *testing.T) {
 			envKey: "PUSH_TIMEOUT",
 			envVal: "invalid-duration",
 			errSub: "PUSH_TIMEOUT",
+		},
+		{
+			name:   "invalid ENABLE_CALENDAR_SYNC",
+			envKey: "ENABLE_CALENDAR_SYNC",
+			envVal: "not-a-bool",
+			errSub: "ENABLE_CALENDAR_SYNC",
+		},
+		{
+			name:   "invalid CALENDAR_POLL_INTERVAL",
+			envKey: "CALENDAR_POLL_INTERVAL",
+			envVal: "invalid-duration",
+			errSub: "CALENDAR_POLL_INTERVAL",
 		},
 	}
 
@@ -625,6 +675,20 @@ func TestValidate_Timeouts(t *testing.T) {
 				c.PushTimeout = -1 * time.Second
 			},
 			errSub: "push_timeout",
+		},
+		{
+			name: "zero CalendarPollInterval",
+			mutate: func(c *AppConfig) {
+				c.CalendarPollInterval = 0
+			},
+			errSub: "calendar_poll_interval",
+		},
+		{
+			name: "negative CalendarPollInterval",
+			mutate: func(c *AppConfig) {
+				c.CalendarPollInterval = -1 * time.Minute
+			},
+			errSub: "calendar_poll_interval",
 		},
 	}
 
@@ -899,3 +963,91 @@ func TestOutboundPushConfig(t *testing.T) {
 		}
 	})
 }
+
+func TestCalendarSyncConfig(t *testing.T) {
+	t.Run("default calendar sync settings", func(t *testing.T) {
+		cfg := DefaultConfig()
+		if cfg.EnableCalendarSync != false {
+			t.Errorf("expected EnableCalendarSync false, got %v", cfg.EnableCalendarSync)
+		}
+		if cfg.CalendarPollInterval != 1*time.Minute {
+			t.Errorf("expected CalendarPollInterval 1m, got %v", cfg.CalendarPollInterval)
+		}
+	})
+
+	t.Run("environment variable overrides for calendar sync settings", func(t *testing.T) {
+		t.Setenv("HASS_TOKEN", "token")
+		t.Setenv("ENABLE_CALENDAR_SYNC", "true")
+		t.Setenv("CALENDAR_POLL_INTERVAL", "45s")
+
+		cfg, err := Parse(nil)
+		if err != nil {
+			t.Fatalf("unexpected error parsing env vars: %v", err)
+		}
+		if !cfg.EnableCalendarSync {
+			t.Errorf("expected EnableCalendarSync true, got %v", cfg.EnableCalendarSync)
+		}
+		if cfg.CalendarPollInterval != 45*time.Second {
+			t.Errorf("expected CalendarPollInterval 45s, got %v", cfg.CalendarPollInterval)
+		}
+	})
+
+	t.Run("CLI flag overrides taking precedence over environment variables", func(t *testing.T) {
+		t.Setenv("HASS_TOKEN", "token")
+		t.Setenv("ENABLE_CALENDAR_SYNC", "false")
+		t.Setenv("CALENDAR_POLL_INTERVAL", "5m")
+
+		args := []string{
+			"--enable-calendar-sync=true",
+			"--calendar-poll-interval", "30s",
+		}
+		cfg, err := Parse(args)
+		if err != nil {
+			t.Fatalf("unexpected error parsing CLI flags: %v", err)
+		}
+		if !cfg.EnableCalendarSync {
+			t.Errorf("expected EnableCalendarSync true from CLI, got %v", cfg.EnableCalendarSync)
+		}
+		if cfg.CalendarPollInterval != 30*time.Second {
+			t.Errorf("expected CalendarPollInterval 30s, got %v", cfg.CalendarPollInterval)
+		}
+	})
+
+	t.Run("CLI underscore flag aliases", func(t *testing.T) {
+		t.Setenv("HASS_TOKEN", "token")
+		args := []string{
+			"--enable_calendar_sync=true",
+			"--calendar_poll_interval", "15s",
+		}
+		cfg, err := Parse(args)
+		if err != nil {
+			t.Fatalf("unexpected error parsing CLI alias flags: %v", err)
+		}
+		if !cfg.EnableCalendarSync {
+			t.Errorf("expected EnableCalendarSync true from CLI alias, got %v", cfg.EnableCalendarSync)
+		}
+		if cfg.CalendarPollInterval != 15*time.Second {
+			t.Errorf("expected CalendarPollInterval 15s, got %v", cfg.CalendarPollInterval)
+		}
+	})
+
+	t.Run("validation rejection when CalendarPollInterval <= 0", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.HassToken = "token"
+
+		cfg.CalendarPollInterval = 0
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected error for CalendarPollInterval=0, got nil")
+		} else if !strings.Contains(strings.ToLower(err.Error()), "calendar_poll_interval") {
+			t.Errorf("expected error mentioning calendar_poll_interval, got: %v", err)
+		}
+
+		cfg.CalendarPollInterval = -10 * time.Second
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected error for negative CalendarPollInterval, got nil")
+		} else if !strings.Contains(strings.ToLower(err.Error()), "calendar_poll_interval") {
+			t.Errorf("expected error mentioning calendar_poll_interval, got: %v", err)
+		}
+	})
+}
+

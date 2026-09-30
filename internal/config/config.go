@@ -29,51 +29,57 @@ var (
 	ErrInvalidGoogleRedirectURL = errors.New("invalid google_redirect_url: must be a valid http or https URL")
 	// ErrInvalidPushTimeout indicates the outbound push request timeout is not positive.
 	ErrInvalidPushTimeout = errors.New("push_timeout must be positive")
+	// ErrInvalidCalendarPollInterval indicates the calendar polling interval is not positive.
+	ErrInvalidCalendarPollInterval = errors.New("calendar_poll_interval must be positive")
 )
 
 // AppConfig defines application configuration parameters.
 type AppConfig struct {
-	BusyBarHost        string
-	BusyBarPort        int
-	BusyBarDeviceID    string
-	HassURL            string
-	HassToken          string
-	HassEventType      string
-	HassTimeout        time.Duration
-	ForwardStateEvents bool
-	Port               int
-	ShutdownTimeout    time.Duration
-	LogLevel           string
-	GoogleClientID     string
-	GoogleClientSecret string
-	GoogleRedirectURL  string
-	CalendarStorePath  string
-	EnableOutboundPush bool
-	BusyBarAPIKey      string
-	PushTimeout        time.Duration
+	BusyBarHost          string
+	BusyBarPort          int
+	BusyBarDeviceID      string
+	HassURL              string
+	HassToken            string
+	HassEventType        string
+	HassTimeout          time.Duration
+	ForwardStateEvents   bool
+	Port                 int
+	ShutdownTimeout      time.Duration
+	LogLevel             string
+	GoogleClientID       string
+	GoogleClientSecret   string
+	GoogleRedirectURL    string
+	CalendarStorePath    string
+	EnableOutboundPush   bool
+	BusyBarAPIKey        string
+	PushTimeout          time.Duration
+	EnableCalendarSync   bool
+	CalendarPollInterval time.Duration
 }
 
 // DefaultConfig returns a new AppConfig populated with default values.
 func DefaultConfig() *AppConfig {
 	return &AppConfig{
-		BusyBarHost:        "192.168.68.196",
-		BusyBarPort:        80,
-		BusyBarDeviceID:    "busybar",
-		HassURL:            "http://homeassistant.local:8123",
-		HassToken:          "",
-		HassEventType:      "busybar_event",
-		HassTimeout:        5 * time.Second,
-		ForwardStateEvents: false,
-		Port:               8080,
-		ShutdownTimeout:    10 * time.Second,
-		LogLevel:           "info",
-		GoogleClientID:     "",
-		GoogleClientSecret: "",
-		GoogleRedirectURL:  "http://localhost:8080/oauth/google/callback",
-		CalendarStorePath:  "/data/calendar_binding.pb",
-		EnableOutboundPush: false,
-		BusyBarAPIKey:      "",
-		PushTimeout:        3 * time.Second,
+		BusyBarHost:          "192.168.68.196",
+		BusyBarPort:          80,
+		BusyBarDeviceID:      "busybar",
+		HassURL:              "http://homeassistant.local:8123",
+		HassToken:            "",
+		HassEventType:        "busybar_event",
+		HassTimeout:          5 * time.Second,
+		ForwardStateEvents:   false,
+		Port:                 8080,
+		ShutdownTimeout:      10 * time.Second,
+		LogLevel:             "info",
+		GoogleClientID:       "",
+		GoogleClientSecret:   "",
+		GoogleRedirectURL:    "http://localhost:8080/oauth/google/callback",
+		CalendarStorePath:    "/data/calendar_binding.pb",
+		EnableOutboundPush:   false,
+		BusyBarAPIKey:        "",
+		PushTimeout:          3 * time.Second,
+		EnableCalendarSync:   false,
+		CalendarPollInterval: 1 * time.Minute,
 	}
 }
 
@@ -131,6 +137,9 @@ func (c *AppConfig) Validate() error {
 	}
 	if c.PushTimeout <= 0 {
 		return ErrInvalidPushTimeout
+	}
+	if c.CalendarPollInterval <= 0 {
+		return ErrInvalidCalendarPollInterval
 	}
 
 	return nil
@@ -225,6 +234,20 @@ func Parse(args []string) (*AppConfig, error) {
 		}
 		cfg.PushTimeout = d
 	}
+	if v := os.Getenv("ENABLE_CALENDAR_SYNC"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ENABLE_CALENDAR_SYNC: %w", err)
+		}
+		cfg.EnableCalendarSync = b
+	}
+	if v := os.Getenv("CALENDAR_POLL_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CALENDAR_POLL_INTERVAL: %w", err)
+		}
+		cfg.CalendarPollInterval = d
+	}
 
 	// Parse CLI flags
 	fs := flag.NewFlagSet("busybar-bridge", flag.ContinueOnError)
@@ -265,6 +288,10 @@ func Parse(args []string) (*AppConfig, error) {
 	fs.StringVar(&cfg.BusyBarAPIKey, "busybar_api_key", cfg.BusyBarAPIKey, "BusyBar outbound push API key (alias)")
 	fs.DurationVar(&cfg.PushTimeout, "push-timeout", cfg.PushTimeout, "BusyBar outbound push HTTP timeout")
 	fs.DurationVar(&cfg.PushTimeout, "push_timeout", cfg.PushTimeout, "BusyBar outbound push HTTP timeout (alias)")
+	fs.BoolVar(&cfg.EnableCalendarSync, "enable-calendar-sync", cfg.EnableCalendarSync, "Enable Google Calendar synchronization")
+	fs.BoolVar(&cfg.EnableCalendarSync, "enable_calendar_sync", cfg.EnableCalendarSync, "Enable Google Calendar synchronization (alias)")
+	fs.DurationVar(&cfg.CalendarPollInterval, "calendar-poll-interval", cfg.CalendarPollInterval, "Google Calendar polling interval")
+	fs.DurationVar(&cfg.CalendarPollInterval, "calendar_poll_interval", cfg.CalendarPollInterval, "Google Calendar polling interval (alias)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
