@@ -53,7 +53,8 @@ type CalendarStatus struct {
 // StatusData encapsulates the telemetry snapshot and calendar status for dashboard rendering.
 type StatusData struct {
 	telemetry.Snapshot
-	Calendar CalendarStatus
+	Calendar    CalendarStatus       `json:"calendar"`
+	ActiveEvent calendar.ActiveEvent `json:"active_event"`
 }
 
 // Config defines the HTTP server configuration parameters.
@@ -78,6 +79,7 @@ type ServerOptions struct {
 	OAuthManager    OAuthManager
 	CalendarManager OAuthManager
 	OAuthConfigured *bool
+	EventTracker    calendar.EventTracker
 }
 
 // ServerOption represents a functional option for configuring a Server.
@@ -96,6 +98,9 @@ func WithServerOptions(opts ServerOptions) ServerOption {
 		}
 		if opts.OAuthConfigured != nil {
 			s.oauthConfigured = opts.OAuthConfigured
+		}
+		if opts.EventTracker != nil {
+			s.eventTracker = opts.EventTracker
 		}
 	}
 }
@@ -126,6 +131,13 @@ func WithOAuthConfigured(configured bool) ServerOption {
 	}
 }
 
+// WithEventTracker configures the calendar.EventTracker for the server.
+func WithEventTracker(tracker calendar.EventTracker) ServerOption {
+	return func(s *Server) {
+		s.eventTracker = tracker
+	}
+}
+
 // Server provides HTTP lifecycle management, observability probe endpoints,
 // and Google Calendar OAuth linking endpoints.
 type Server struct {
@@ -134,6 +146,7 @@ type Server struct {
 	calendarStore   CalendarStore
 	oauthMgr        OAuthManager
 	oauthConfigured *bool
+	eventTracker    calendar.EventTracker
 	httpServer      *http.Server
 	listener        net.Listener
 	tmpl            *template.Template
@@ -226,6 +239,11 @@ func (s *Server) OAuthManager() OAuthManager {
 // CalendarManager returns the configured OAuthManager dependency.
 func (s *Server) CalendarManager() OAuthManager {
 	return s.oauthMgr
+}
+
+// EventTracker returns the configured EventTracker dependency.
+func (s *Server) EventTracker() calendar.EventTracker {
+	return s.eventTracker
 }
 
 // HTTPServer returns the internal http.Server instance.
@@ -388,9 +406,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		snapshot = s.store.Snapshot()
 	}
 
+	activeEvent := calendar.ActiveEvent{Idle: true}
+	if s.eventTracker != nil {
+		activeEvent = s.eventTracker.GetCurrentEvent()
+	}
+
 	data := StatusData{
-		Snapshot: snapshot,
-		Calendar: s.calendarStatus(r),
+		Snapshot:    snapshot,
+		Calendar:    s.calendarStatus(r),
+		ActiveEvent: activeEvent,
 	}
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") || r.URL.Query().Get("format") == "json" {

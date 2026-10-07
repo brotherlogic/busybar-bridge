@@ -1003,6 +1003,261 @@ func TestServer_OptionsAndGetters(t *testing.T) {
 	}
 }
 
+type mockEventTracker struct {
+	event calendar.ActiveEvent
+}
+
+func (m *mockEventTracker) GetCurrentEvent() calendar.ActiveEvent {
+	return m.event
+}
+
+func TestServerOptions_EventTracker(t *testing.T) {
+	store := telemetry.NewStore()
+	tracker := &mockEventTracker{
+		event: calendar.ActiveEvent{
+			Summary:   "Standup",
+			Countdown: "00:10",
+			Idle:      false,
+		},
+	}
+
+	opts := ServerOptions{
+		EventTracker: tracker,
+	}
+	srv := NewWithOptions(DefaultConfig(), store, opts)
+	if srv.EventTracker() != tracker {
+		t.Errorf("expected EventTracker to match provided tracker via ServerOptions")
+	}
+
+	srv2 := New(DefaultConfig(), store, WithEventTracker(tracker))
+	if srv2.EventTracker() != tracker {
+		t.Errorf("expected EventTracker to match provided tracker via WithEventTracker")
+	}
+}
+
+func TestStatusJSON_ActiveEventAndCalendarSync_AcceptHeader(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetCalendarSyncEnabled(true)
+	store.RecordCalendarPoll(true, "Sprint Planning", nil)
+	store.RecordCalendarPoll(false, "Sprint Planning", errors.New("temporary 503"))
+
+	startTime := time.Now().Add(-15 * time.Minute).Truncate(time.Second)
+	endTime := time.Now().Add(45 * time.Minute).Truncate(time.Second)
+	tracker := &mockEventTracker{
+		event: calendar.ActiveEvent{
+			Summary:   "Sprint Planning",
+			StartTime: startTime,
+			EndTime:   endTime,
+			Countdown: "00:45",
+			Idle:      false,
+		},
+	}
+
+	srv := New(DefaultConfig(), store, WithEventTracker(tracker))
+
+	for _, path := range []string{"/status", "/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept", "application/json")
+		rec := httptest.NewRecorder()
+
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("path %s: expected status %d, got %d", path, http.StatusOK, rec.Code)
+		}
+
+		contentType := rec.Header().Get("Content-Type")
+		if !strings.Contains(contentType, "application/json") {
+			t.Errorf("path %s: expected Content-Type application/json, got %q", path, contentType)
+		}
+
+		var data StatusData
+		if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+			t.Fatalf("path %s: failed to decode JSON response: %v", path, err)
+		}
+
+		// Verify ActiveEvent fields
+		if data.ActiveEvent.Idle {
+			t.Errorf("path %s: expected ActiveEvent.Idle=false, got true", path)
+		}
+		if data.ActiveEvent.Summary != "Sprint Planning" {
+			t.Errorf("path %s: expected ActiveEvent.Summary='Sprint Planning', got %q", path, data.ActiveEvent.Summary)
+		}
+		if data.ActiveEvent.Countdown != "00:45" {
+			t.Errorf("path %s: expected ActiveEvent.Countdown='00:45', got %q", path, data.ActiveEvent.Countdown)
+		}
+		if !data.ActiveEvent.StartTime.Equal(startTime) {
+			t.Errorf("path %s: expected ActiveEvent.StartTime=%v, got %v", path, startTime, data.ActiveEvent.StartTime)
+		}
+		if !data.ActiveEvent.EndTime.Equal(endTime) {
+			t.Errorf("path %s: expected ActiveEvent.EndTime=%v, got %v", path, endTime, data.ActiveEvent.EndTime)
+		}
+
+		// Verify CalendarSync telemetry fields
+		if !data.CalendarSync.Enabled {
+			t.Errorf("path %s: expected CalendarSync.Enabled=true, got %v", path, data.CalendarSync.Enabled)
+		}
+		if data.CalendarSync.TotalPolls != 2 {
+			t.Errorf("path %s: expected CalendarSync.TotalPolls=2, got %d", path, data.CalendarSync.TotalPolls)
+		}
+		if data.CalendarSync.SuccessPolls != 1 {
+			t.Errorf("path %s: expected CalendarSync.SuccessPolls=1, got %d", path, data.CalendarSync.SuccessPolls)
+		}
+		if data.CalendarSync.FailedPolls != 1 {
+			t.Errorf("path %s: expected CalendarSync.FailedPolls=1, got %d", path, data.CalendarSync.FailedPolls)
+		}
+		if data.CalendarSync.LastError != "temporary 503" {
+			t.Errorf("path %s: expected CalendarSync.LastError='temporary 503', got %q", path, data.CalendarSync.LastError)
+		}
+		if data.CalendarSync.ActiveSummary != "Sprint Planning" {
+			t.Errorf("path %s: expected CalendarSync.ActiveSummary='Sprint Planning', got %q", path, data.CalendarSync.ActiveSummary)
+		}
+
+		// Verify raw JSON keys
+		var raw map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("path %s: failed to unmarshal raw map: %v", path, err)
+		}
+
+		activeRaw, exists := raw["active_event"]
+		if !exists {
+			activeRaw, exists = raw["ActiveEvent"]
+		}
+		if !exists || activeRaw == nil {
+			t.Fatalf("path %s: expected active_event object in raw JSON payload, got keys: %v", path, raw)
+		}
+		activeMap, ok := activeRaw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("path %s: expected active_event to be a map, got %T", path, activeRaw)
+		}
+		if summary, _ := activeMap["summary"].(string); summary != "Sprint Planning" {
+			t.Errorf("path %s: expected raw active_event.summary='Sprint Planning', got %v", path, activeMap["summary"])
+		}
+		if countdown, _ := activeMap["countdown"].(string); countdown != "00:45" {
+			t.Errorf("path %s: expected raw active_event.countdown='00:45', got %v", path, activeMap["countdown"])
+		}
+
+		calSyncRaw, exists := raw["calendar_sync"]
+		if !exists {
+			calSyncRaw, exists = raw["CalendarSync"]
+		}
+		if !exists || calSyncRaw == nil {
+			t.Fatalf("path %s: expected calendar_sync object in raw JSON payload, got keys: %v", path, raw)
+		}
+	}
+}
+
+func TestStatusJSON_ActiveMeetingCountdown_QueryParam(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetCalendarSyncEnabled(true)
+
+	tracker := &mockEventTracker{
+		event: calendar.ActiveEvent{
+			Summary:   "Architecture Review",
+			Countdown: "01:15",
+			Idle:      false,
+		},
+	}
+
+	srv := New(DefaultConfig(), store, WithEventTracker(tracker))
+
+	for _, path := range []string{"/status?format=json", "/?format=json"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("path %s: expected status %d, got %d", path, http.StatusOK, rec.Code)
+		}
+
+		contentType := rec.Header().Get("Content-Type")
+		if !strings.Contains(contentType, "application/json") {
+			t.Errorf("path %s: expected Content-Type application/json, got %q", path, contentType)
+		}
+
+		var data StatusData
+		if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+			t.Fatalf("path %s: failed to decode JSON response: %v", path, err)
+		}
+
+		if data.ActiveEvent.Idle {
+			t.Errorf("path %s: expected ActiveEvent.Idle=false, got true", path)
+		}
+		if data.ActiveEvent.Summary != "Architecture Review" {
+			t.Errorf("path %s: expected ActiveEvent.Summary='Architecture Review', got %q", path, data.ActiveEvent.Summary)
+		}
+		if data.ActiveEvent.Countdown != "01:15" {
+			t.Errorf("path %s: expected ActiveEvent.Countdown='01:15', got %q", path, data.ActiveEvent.Countdown)
+		}
+	}
+}
+
+func TestStatusJSON_ActiveEvent_DefaultIdleWithoutTracker(t *testing.T) {
+	store := telemetry.NewStore()
+	srv := New(DefaultConfig(), store)
+
+	req := httptest.NewRequest(http.MethodGet, "/status?format=json", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	var data StatusData
+	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+
+	if !data.ActiveEvent.Idle {
+		t.Errorf("expected default ActiveEvent.Idle=true when no tracker configured, got false")
+	}
+	if data.ActiveEvent.Summary != "" {
+		t.Errorf("expected empty ActiveEvent.Summary, got %q", data.ActiveEvent.Summary)
+	}
+	if data.ActiveEvent.Countdown != "" {
+		t.Errorf("expected empty ActiveEvent.Countdown, got %q", data.ActiveEvent.Countdown)
+	}
+}
+
+func TestStatusJSON_ActiveEvent_NilStore(t *testing.T) {
+	tracker := &mockEventTracker{
+		event: calendar.ActiveEvent{
+			Summary:   "1-on-1 Sync",
+			Countdown: "00:25",
+			Idle:      false,
+		},
+	}
+	srv := New(DefaultConfig(), nil, WithEventTracker(tracker))
+
+	req := httptest.NewRequest(http.MethodGet, "/status?format=json", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	var data StatusData
+	if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+
+	if data.ActiveEvent.Summary != "1-on-1 Sync" {
+		t.Errorf("expected ActiveEvent.Summary='1-on-1 Sync', got %q", data.ActiveEvent.Summary)
+	}
+	if data.ActiveEvent.Countdown != "00:25" {
+		t.Errorf("expected ActiveEvent.Countdown='00:25', got %q", data.ActiveEvent.Countdown)
+	}
+	if data.CalendarSync.Enabled {
+		t.Errorf("expected CalendarSync.Enabled=false for nil store, got true")
+	}
+}
+
+
 
 
 
