@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/brotherlogic/busybar-bridge/internal/calendar"
 	"github.com/brotherlogic/busybar-bridge/internal/telemetry"
 )
 
@@ -41,6 +42,10 @@ type mockEventTrace struct {
 	LatencyMs int64
 }
 
+type mockNestedSnapshot struct {
+	CalendarSync telemetry.CalendarSyncTelemetry
+}
+
 type mockSnapshot struct {
 	StartTime    time.Time
 	Uptime       time.Duration
@@ -48,9 +53,12 @@ type mockSnapshot struct {
 	Counters     mockEventCounters
 	Forwarding   mockForwardingTelemetry
 	Push         telemetry.PushTelemetry
+	CalendarSync telemetry.CalendarSyncTelemetry
+	Snapshot     mockNestedSnapshot
 	TotalEvents  int64
 	RecentEvents []mockEventTrace
 	Calendar     CalendarStatus
+	ActiveEvent  calendar.ActiveEvent
 }
 
 func parseStatusTemplate(t *testing.T) *template.Template {
@@ -62,8 +70,14 @@ func parseStatusTemplate(t *testing.T) *template.Template {
 	return tmpl
 }
 
-func renderTemplate(t *testing.T, tmpl *template.Template, data mockSnapshot) string {
+func renderTemplate(t *testing.T, tmpl *template.Template, data any) string {
 	t.Helper()
+	if ms, ok := data.(mockSnapshot); ok {
+		if ms.Snapshot.CalendarSync == (telemetry.CalendarSyncTelemetry{}) && ms.CalendarSync != (telemetry.CalendarSyncTelemetry{}) {
+			ms.Snapshot.CalendarSync = ms.CalendarSync
+		}
+		data = ms
+	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, data); err != nil {
 		t.Fatalf("failed to execute template: %v", err)
@@ -477,6 +491,162 @@ func TestStatusTemplate_PushCSSClassesPresent(t *testing.T) {
 		if !strings.Contains(rendered, "."+class) {
 			t.Errorf("expected CSS stylesheet to define class %q", "."+class)
 		}
+	}
+}
+
+func TestStatusTemplate_ActiveEvent_IdleBadge(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	// Case 1: Idle is explicitly true
+	snapshotIdle := mockSnapshot{
+		ActiveEvent: calendar.ActiveEvent{
+			Idle: true,
+		},
+	}
+	renderedIdle := renderTemplate(t, tmpl, snapshotIdle)
+	if !strings.Contains(renderedIdle, `<span class="badge badge-neutral">IDLE</span>`) {
+		t.Errorf("expected '<span class=\"badge badge-neutral\">IDLE</span>' when active meeting is idle")
+	}
+	if strings.Contains(renderedIdle, "IN MEETING:") {
+		t.Errorf("did not expect 'IN MEETING:' when active meeting is idle")
+	}
+
+	// Case 2: Summary is empty (even if Idle was false)
+	snapshotEmptySummary := mockSnapshot{
+		ActiveEvent: calendar.ActiveEvent{
+			Idle:    false,
+			Summary: "",
+		},
+	}
+	renderedEmpty := renderTemplate(t, tmpl, snapshotEmptySummary)
+	if !strings.Contains(renderedEmpty, `<span class="badge badge-neutral">IDLE</span>`) {
+		t.Errorf("expected '<span class=\"badge badge-neutral\">IDLE</span>' when summary is empty")
+	}
+	if strings.Contains(renderedEmpty, "IN MEETING:") {
+		t.Errorf("did not expect 'IN MEETING:' when summary is empty")
+	}
+}
+
+func TestStatusTemplate_ActiveEvent_InMeetingBadgeAndDetails(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	startTime := time.Date(2026, 10, 8, 14, 0, 0, 0, time.Local)
+	endTime := time.Date(2026, 10, 8, 15, 0, 0, 0, time.Local)
+
+	snapshot := mockSnapshot{
+		ActiveEvent: calendar.ActiveEvent{
+			Summary:   "Sprint Planning",
+			StartTime: startTime,
+			EndTime:   endTime,
+			Countdown: "00:45",
+			Idle:      false,
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	// In meeting warning badge
+	expectedBadge := `<span class="badge badge-warning">IN MEETING: 00:45</span>`
+	if !strings.Contains(rendered, expectedBadge) {
+		t.Errorf("expected badge %q in rendered output", expectedBadge)
+	}
+	if strings.Contains(rendered, `<span class="badge badge-neutral">IDLE</span>`) {
+		t.Errorf("did not expect IDLE badge when meeting is active")
+	}
+
+	// Active meeting summary
+	if !strings.Contains(rendered, "Sprint Planning") {
+		t.Errorf("expected active meeting summary 'Sprint Planning' in rendered output")
+	}
+
+	// Active meeting countdown
+	if !strings.Contains(rendered, "00:45") {
+		t.Errorf("expected active meeting countdown '00:45' in rendered output")
+	}
+
+	// Active meeting start and end times
+	startStr := startTime.Local().Format("15:04")
+	endStr := endTime.Local().Format("15:04")
+	if !strings.Contains(rendered, startStr) {
+		t.Errorf("expected scheduled start time %q in rendered output", startStr)
+	}
+	if !strings.Contains(rendered, endStr) {
+		t.Errorf("expected scheduled end time %q in rendered output", endStr)
+	}
+}
+
+func TestStatusTemplate_CalendarSync_TelemetryCountersAndErrorBanner(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	lastPoll := time.Date(2026, 10, 8, 14, 15, 30, 0, time.UTC)
+	snapshot := mockSnapshot{
+		Snapshot: mockNestedSnapshot{
+			CalendarSync: telemetry.CalendarSyncTelemetry{
+				Enabled:      true,
+				TotalPolls:   128,
+				SuccessPolls: 120,
+				FailedPolls:  8,
+				LastPollAt:   lastPoll,
+				LastError:    "Google API 503 Backend Error",
+			},
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	// Labels
+	for _, label := range []string{"Total Polls", "Successful Polls", "Failed Polls", "Last Poll Time"} {
+		if !strings.Contains(rendered, label) {
+			t.Errorf("expected rendered HTML to contain label %q", label)
+		}
+	}
+
+	// Values and classes
+	if !strings.Contains(rendered, "128") {
+		t.Errorf("expected rendered HTML to contain Total Polls '128'")
+	}
+	if !strings.Contains(rendered, "120") || !strings.Contains(rendered, "text-success") {
+		t.Errorf("expected Successful Polls '120' with 'text-success' class")
+	}
+	if !strings.Contains(rendered, "8") || !strings.Contains(rendered, "text-danger") {
+		t.Errorf("expected Failed Polls '8' with 'text-danger' class")
+	}
+	if !strings.Contains(rendered, lastPoll.String()) && !strings.Contains(rendered, lastPoll.Local().Format("15:04")) && !strings.Contains(rendered, "2026-10-08") {
+		t.Errorf("expected Last Poll Time to be rendered")
+	}
+
+	// Error banner
+	expectedBanner := `<div class="error-banner">Last Error: Google API 503 Backend Error</div>`
+	if !strings.Contains(rendered, expectedBanner) {
+		t.Errorf("expected error banner %q in rendered output", expectedBanner)
+	}
+}
+
+func TestStatusTemplate_CalendarSync_ErrorBanner_OmittedWhenEmpty(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	snapshot := mockSnapshot{
+		Snapshot: mockNestedSnapshot{
+			CalendarSync: telemetry.CalendarSyncTelemetry{
+				Enabled:      true,
+				TotalPolls:   10,
+				SuccessPolls: 10,
+				FailedPolls:  0,
+				LastError:    "",
+			},
+		},
+	}
+	rendered := renderTemplate(t, tmpl, snapshot)
+
+	if strings.Contains(rendered, "Last Error:") {
+		t.Errorf("error banner should not be rendered when CalendarSync.LastError is empty")
+	}
+}
+
+func TestStatusTemplate_BadgeWarningCSSClassPresent(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+	rendered := renderTemplate(t, tmpl, mockSnapshot{})
+
+	if !strings.Contains(rendered, ".badge-warning") {
+		t.Errorf("expected CSS stylesheet to define class '.badge-warning'")
 	}
 }
 
