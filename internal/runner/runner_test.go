@@ -930,3 +930,111 @@ func TestRunner_PushClient_StartError(t *testing.T) {
 	}
 }
 
+func TestNewRunner_CalendarSync_DefaultsAndDisabled(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.CalendarPoller() != nil {
+		t.Errorf("expected calendar poller to be nil by default")
+	}
+	snap := r.Store().Snapshot()
+	if snap.CalendarSync.Enabled {
+		t.Errorf("expected calendar sync telemetry enabled to be false by default")
+	}
+}
+
+func TestNewRunner_CalendarSync_Enabled(t *testing.T) {
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "calendar.pb")
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.CalendarStorePath = storePath
+	cfg.EnableCalendarSync = true
+	cfg.CalendarPollInterval = 2 * time.Minute
+	cfg.GoogleClientID = "test-client-id"
+	cfg.GoogleClientSecret = "test-client-secret"
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.CalendarPoller() == nil {
+		t.Fatalf("expected non-nil CalendarPoller when calendar sync is enabled")
+	}
+	snap := r.Store().Snapshot()
+	if !snap.CalendarSync.Enabled {
+		t.Errorf("expected calendar sync telemetry enabled to be true")
+	}
+}
+
+func TestNewRunner_WithCalendarPoller_Option(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+
+	poller, err := calendar.NewPoller(calendar.PollerConfig{
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create poller: %v", err)
+	}
+
+	r, err := runner.NewRunner(cfg, runner.WithCalendarPoller(poller))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.CalendarPoller() != poller {
+		t.Errorf("expected custom CalendarPoller to be set on Runner")
+	}
+}
+
+func TestRunner_CalendarPoller_LifecycleAndGracefulShutdown(t *testing.T) {
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(freeLn.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	_ = freeLn.Close()
+
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "calendar.pb")
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "token"
+	cfg.Port = port
+	cfg.CalendarStorePath = storePath
+	cfg.EnableCalendarSync = true
+	cfg.CalendarPollInterval = 1 * time.Minute
+	cfg.ShutdownTimeout = 500 * time.Millisecond
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create runner: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- r.Run(ctx)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("expected clean shutdown, got %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Run() did not finish within expected bounds")
+	}
+}
+
+

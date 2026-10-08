@@ -28,6 +28,7 @@ type Runner struct {
 	server        *server.Server
 	calendarStore *calendar.Store
 	calendarMgr   *calendar.Manager
+	calendarPoller *calendar.Poller
 	pushClient    busybar.PushClient
 
 	mu      sync.Mutex
@@ -89,6 +90,13 @@ func WithCalendarManager(mgr *calendar.Manager) Option {
 // WithOAuthManager overrides the Google OAuth manager (alias for WithCalendarManager).
 func WithOAuthManager(mgr *calendar.Manager) Option {
 	return WithCalendarManager(mgr)
+}
+
+// WithCalendarPoller overrides the Google Calendar poller.
+func WithCalendarPoller(poller *calendar.Poller) Option {
+	return func(r *Runner) {
+		r.calendarPoller = poller
+	}
 }
 
 // WithPushClient overrides the BusyBar push client.
@@ -160,6 +168,21 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 	}
 
 	r.store.SetPushEnabled(cfg.EnableOutboundPush)
+	r.store.SetCalendarSyncEnabled(cfg.EnableCalendarSync)
+
+	if r.calendarPoller == nil && cfg.EnableCalendarSync {
+		poller, err := calendar.NewPoller(calendar.PollerConfig{
+			Enabled:      cfg.EnableCalendarSync,
+			PollInterval: cfg.CalendarPollInterval,
+			Store:        r.calendarStore,
+			Manager:      r.calendarMgr,
+			Telemetry:    r.store,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize calendar poller: %w", err)
+		}
+		r.calendarPoller = poller
+	}
 
 	if r.pushClient == nil {
 		pushCfg := busybar.DefaultPushConfig()
@@ -185,6 +208,9 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 			serverOpts = append(serverOpts, server.WithCalendarManager(r.calendarMgr))
 		}
 		serverOpts = append(serverOpts, server.WithOAuthConfigured(cfg.IsOAuthConfigured()))
+		if r.calendarPoller != nil {
+			serverOpts = append(serverOpts, server.WithEventTracker(r.calendarPoller))
+		}
 
 		r.server = server.NewServer(serverCfg, r.store, serverOpts...)
 	}
@@ -240,6 +266,11 @@ func (r *Runner) OAuthManager() *calendar.Manager {
 // PushClient returns the BusyBar outbound push client.
 func (r *Runner) PushClient() busybar.PushClient {
 	return r.pushClient
+}
+
+// CalendarPoller returns the calendar poller, or nil if not configured.
+func (r *Runner) CalendarPoller() *calendar.Poller {
+	return r.calendarPoller
 }
 
 // TranslateEvent converts a normalized Protobuf event into a typed Home Assistant Event.
@@ -395,6 +426,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	// 5. Start calendar poller
+	if r.calendarPoller != nil {
+		if err := r.calendarPoller.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start calendar poller: %w", err)
+		}
+	}
+
 	// Periodically sync connection state from client to telemetry store
 	syncCtx, syncCancel := context.WithCancel(ctx)
 	defer syncCancel()
@@ -484,6 +522,13 @@ frameLoop:
 			_ = r.pushClient.Close()
 		}()
 	}
+	if r.calendarPoller != nil {
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			_ = r.calendarPoller.Close()
+		}()
+	}
 
 	clientsClosed := make(chan struct{})
 	go func() {
@@ -518,6 +563,11 @@ func (r *Runner) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if r.calendarPoller != nil {
+		if err := r.calendarPoller.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if r.hassClient != nil {
 		if err := r.hassClient.Close(); err != nil {
 			errs = append(errs, err)
@@ -547,6 +597,18 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			if err := r.pushClient.Close(); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
+	}
+
+	if r.calendarPoller != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.calendarPoller.Close(); err != nil {
 				errMu.Lock()
 				errs = append(errs, err)
 				errMu.Unlock()
