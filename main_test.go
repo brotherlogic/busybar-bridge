@@ -259,3 +259,47 @@ func TestRun_WithOutboundPushFlags(t *testing.T) {
 	}
 }
 
+func TestRun_WithCalendarSyncFlags(t *testing.T) {
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "calendar.pb")
+
+	args := []string{
+		"--hass-token=test-token-12345",
+		"--port=19101",
+		"--busybar-port=19102",
+		"--shutdown-timeout=500ms",
+		"--enable-calendar-sync=true",
+		"--calendar-poll-interval=30s",
+		"--calendar-store-path=" + storePath,
+	}
+
+	code := run(ctx, args, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 on graceful shutdown with calendar sync flags, got %d. stderr: %s", code, stderr.String())
+	}
+}
+
+func TestRun_ValidationFailure_InvalidCalendarPollInterval(t *testing.T) {
+	var stderr bytes.Buffer
+	ctx := context.Background()
+	args := []string{
+		"--hass-token=valid-token",
+		"--calendar-poll-interval=-5s",
+	}
+	code := run(ctx, args, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1 for negative calendar poll interval, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "calendar_poll_interval must be positive") {
+		t.Fatalf("expected error message to contain 'calendar_poll_interval must be positive', got: %s", stderr.String())
+	}
+}
+
+
