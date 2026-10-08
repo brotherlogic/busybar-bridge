@@ -87,6 +87,11 @@
       border-color: #64748b;
       color: #94a3b8;
     }
+    .badge-warning {
+      background-color: var(--pending-bg);
+      border-color: var(--pending-border);
+      color: var(--pending-text);
+    }
     .text-success {
       color: var(--success-text);
     }
@@ -127,6 +132,11 @@
       font-size: 1.5rem;
       font-weight: 700;
       color: var(--text-main);
+    }
+    .stat-time {
+      font-size: 0.95rem;
+      font-weight: 600;
+      word-break: break-all;
     }
     .metrics-grid {
       display: grid;
@@ -279,6 +289,22 @@
       font-size: 0.8125rem;
       margin-top: 0.25rem;
     }
+    .active-event-card {
+      margin-bottom: 2rem;
+    }
+    .active-event-details {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      font-size: 0.875rem;
+      margin-bottom: 1rem;
+    }
+    .active-event-meta {
+      color: var(--text-muted);
+    }
+    .active-event-meta strong {
+      color: var(--text-main);
+    }
     .calendar-guidance {
       font-size: 0.875rem;
       color: var(--text-muted);
@@ -391,6 +417,37 @@
               </div>
               {{end}}
             </div>
+          </div>
+
+          <div class="card active-event-card">
+            <div class="card-header">
+              <div class="card-title">Active Event</div>
+              <div class="active-event-status-badge">
+                {{if or .ActiveEvent.Idle (not .ActiveEvent.Summary)}}
+                <span class="badge badge-neutral">IDLE</span>
+                {{else}}
+                <span class="badge badge-warning">IN MEETING: {{.ActiveEvent.Countdown}}</span>
+                {{end}}
+              </div>
+            </div>
+            <div class="active-event-body">
+              {{if and (not .ActiveEvent.Idle) .ActiveEvent.Summary}}
+              <div class="active-event-details">
+                <p class="active-event-meta"><strong>Meeting:</strong> {{.ActiveEvent.Summary}}</p>
+                {{if not .ActiveEvent.StartTime.IsZero}}
+                <p class="active-event-meta"><strong>Scheduled:</strong> {{.ActiveEvent.StartTime.Local.Format "15:04"}} - {{.ActiveEvent.EndTime.Local.Format "15:04"}}</p>
+                {{end}}
+                <p class="active-event-meta"><strong>Countdown:</strong> {{.ActiveEvent.Countdown}}</p>
+              </div>
+              {{end}}
+            </div>
+            <div class="stats-grid">
+              <div class="stat-item"><span class="stat-label">Total Polls</span><span class="stat-value">{{.Snapshot.CalendarSync.TotalPolls}}</span></div>
+              <div class="stat-item"><span class="stat-label">Successful Polls</span><span class="stat-value text-success">{{.Snapshot.CalendarSync.SuccessPolls}}</span></div>
+              <div class="stat-item"><span class="stat-label">Failed Polls</span><span class="stat-value text-danger">{{.Snapshot.CalendarSync.FailedPolls}}</span></div>
+              <div class="stat-item"><span class="stat-label">Last Poll Time</span><span class="stat-value stat-time">{{if not .Snapshot.CalendarSync.LastPollAt.IsZero}}{{.Snapshot.CalendarSync.LastPollAt}}{{else}}-{{end}}</span></div>
+            </div>
+            {{if .Snapshot.CalendarSync.LastError}}<div class="error-banner">Last Error: {{.Snapshot.CalendarSync.LastError}}</div>{{end}}
           </div>
         </div>
       </section>

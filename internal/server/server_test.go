@@ -1257,6 +1257,69 @@ func TestStatusJSON_ActiveEvent_NilStore(t *testing.T) {
 	}
 }
 
+func TestStatusPageRendering_ActiveEventAndCalendarSync(t *testing.T) {
+	store := telemetry.NewStore()
+	store.SetCalendarSyncEnabled(true)
+	store.RecordCalendarPoll(true, "All-Hands Meeting", nil)
+	store.RecordCalendarPoll(false, "All-Hands Meeting", errors.New("temporary 502 bad gateway"))
+
+	startTime := time.Date(2026, 10, 8, 10, 0, 0, 0, time.Local)
+	endTime := time.Date(2026, 10, 8, 11, 0, 0, 0, time.Local)
+	tracker := &mockEventTracker{
+		event: calendar.ActiveEvent{
+			Summary:   "All-Hands Meeting",
+			StartTime: startTime,
+			EndTime:   endTime,
+			Countdown: "00:50",
+			Idle:      false,
+		},
+	}
+
+	srv := New(DefaultConfig(), store, WithEventTracker(tracker))
+
+	for _, path := range []string{"/status", "/"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("path %s: expected status %d, got %d", path, http.StatusOK, rec.Code)
+		}
+
+		body := rec.Body.String()
+
+		// Verify Active Event card rendering
+		if !strings.Contains(body, `<span class="badge badge-warning">IN MEETING: 00:50</span>`) {
+			t.Errorf("path %s: expected IN MEETING badge in rendered HTML", path)
+		}
+		if !strings.Contains(body, "All-Hands Meeting") {
+			t.Errorf("path %s: expected meeting summary 'All-Hands Meeting' in rendered HTML", path)
+		}
+		if !strings.Contains(body, "00:50") {
+			t.Errorf("path %s: expected meeting countdown '00:50' in rendered HTML", path)
+		}
+		if !strings.Contains(body, startTime.Local().Format("15:04")) {
+			t.Errorf("path %s: expected scheduled start time in rendered HTML", path)
+		}
+
+		// Verify Calendar Sync telemetry rendering
+		if !strings.Contains(body, "Total Polls") || !strings.Contains(body, "2") {
+			t.Errorf("path %s: expected Total Polls '2' in rendered HTML", path)
+		}
+		if !strings.Contains(body, "Successful Polls") || !strings.Contains(body, "1") {
+			t.Errorf("path %s: expected Successful Polls '1' in rendered HTML", path)
+		}
+		if !strings.Contains(body, "Failed Polls") || !strings.Contains(body, "1") {
+			t.Errorf("path %s: expected Failed Polls '1' in rendered HTML", path)
+		}
+		if !strings.Contains(body, "Last Error: temporary 502 bad gateway") {
+			t.Errorf("path %s: expected CalendarSync error banner in rendered HTML", path)
+		}
+	}
+}
+
+
 
 
 
