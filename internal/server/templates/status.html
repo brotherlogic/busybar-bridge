@@ -440,6 +440,13 @@
                 <p class="active-event-meta"><strong>Countdown:</strong> {{.ActiveEvent.Countdown}}</p>
               </div>
               {{end}}
+              {{if or .DisplayState.Mode .DisplayState.TopLine .DisplayState.BottomLine}}
+              <div class="active-event-details">
+                <p class="active-event-meta"><strong>Display Mode:</strong> <span class="badge {{if eq .DisplayState.Mode "busy"}}badge-warning{{else}}badge-neutral{{end}}">{{.DisplayState.Mode}}</span></p>
+                <p class="active-event-meta"><strong>Screen Line 1:</strong> {{.DisplayState.TopLine}}</p>
+                <p class="active-event-meta"><strong>Screen Line 2:</strong> {{.DisplayState.BottomLine}}</p>
+              </div>
+              {{end}}
             </div>
             <div class="stats-grid">
               <div class="stat-item"><span class="stat-label">Total Polls</span><span class="stat-value">{{.Snapshot.CalendarSync.TotalPolls}}</span></div>

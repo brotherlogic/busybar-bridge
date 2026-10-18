@@ -59,6 +59,7 @@ type mockSnapshot struct {
 	RecentEvents []mockEventTrace
 	Calendar     CalendarStatus
 	ActiveEvent  calendar.ActiveEvent
+	DisplayState calendar.DisplayState
 }
 
 func parseStatusTemplate(t *testing.T) *template.Template {
@@ -648,5 +649,59 @@ func TestStatusTemplate_BadgeWarningCSSClassPresent(t *testing.T) {
 	if !strings.Contains(rendered, ".badge-warning") {
 		t.Errorf("expected CSS stylesheet to define class '.badge-warning'")
 	}
+}
+
+func TestStatusTemplate_DisplayState_BusyAndIdle(t *testing.T) {
+	tmpl := parseStatusTemplate(t)
+
+	t.Run("active_meeting_state", func(t *testing.T) {
+		snapshot := mockSnapshot{
+			ActiveEvent: calendar.ActiveEvent{
+				Summary:   "Sprint Planning",
+				Countdown: "00:45",
+				Idle:      false,
+			},
+			DisplayState: calendar.DisplayState{
+				Mode:       calendar.DisplayModeBusy,
+				TopLine:    "Sprint Plannin",
+				BottomLine: "00:45",
+			},
+		}
+		rendered := renderTemplate(t, tmpl, snapshot)
+
+		if !strings.Contains(rendered, "Sprint Plannin") {
+			t.Errorf("expected rendered HTML to contain DisplayState.TopLine 'Sprint Plannin'")
+		}
+		if !strings.Contains(rendered, "00:45") {
+			t.Errorf("expected rendered HTML to contain DisplayState.BottomLine '00:45'")
+		}
+		if !strings.Contains(strings.ToLower(rendered), "busy") {
+			t.Errorf("expected rendered HTML to contain DisplayState.Mode 'busy'")
+		}
+	})
+
+	t.Run("idle_state", func(t *testing.T) {
+		snapshot := mockSnapshot{
+			ActiveEvent: calendar.ActiveEvent{
+				Idle: true,
+			},
+			DisplayState: calendar.DisplayState{
+				Mode:       calendar.DisplayModeIdle,
+				TopLine:    "Sun Oct 18",
+				BottomLine: "10:15",
+			},
+		}
+		rendered := renderTemplate(t, tmpl, snapshot)
+
+		if !strings.Contains(rendered, "Sun Oct 18") {
+			t.Errorf("expected rendered HTML to contain idle DisplayState.TopLine 'Sun Oct 18'")
+		}
+		if !strings.Contains(rendered, "10:15") {
+			t.Errorf("expected rendered HTML to contain idle DisplayState.BottomLine '10:15'")
+		}
+		if !strings.Contains(strings.ToLower(rendered), "idle") {
+			t.Errorf("expected rendered HTML to contain DisplayState.Mode 'idle'")
+		}
+	})
 }
 
