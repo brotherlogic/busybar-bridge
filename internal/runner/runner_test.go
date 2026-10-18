@@ -1037,4 +1037,224 @@ func TestRunner_CalendarPoller_LifecycleAndGracefulShutdown(t *testing.T) {
 	}
 }
 
+func TestNewRunner_DisplayOrchestrator_DisabledWhenFlagsFalse(t *testing.T) {
+	tests := []struct {
+		name               string
+		enableOutboundPush bool
+		enableCalendarSync bool
+	}{
+		{
+			name:               "both disabled",
+			enableOutboundPush: false,
+			enableCalendarSync: false,
+		},
+		{
+			name:               "only outbound push enabled",
+			enableOutboundPush: true,
+			enableCalendarSync: false,
+		},
+		{
+			name:               "only calendar sync enabled",
+			enableOutboundPush: false,
+			enableCalendarSync: true,
+		},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.HassToken = "valid-token"
+			cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+			cfg.EnableOutboundPush = tt.enableOutboundPush
+			cfg.EnableCalendarSync = tt.enableCalendarSync
+
+			r, err := runner.NewRunner(cfg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if r.DisplayOrchestrator() != nil {
+				t.Errorf("expected DisplayOrchestrator to be nil when %s, got %v", tt.name, r.DisplayOrchestrator())
+			}
+			if r.Server().DisplayProvider() != nil {
+				t.Errorf("expected Server.DisplayProvider() to be nil when %s, got %v", tt.name, r.Server().DisplayProvider())
+			}
+		})
+	}
+}
+
+func TestNewRunner_DisplayOrchestrator_EnabledWhenBothFlagsTrue(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+	cfg.EnableOutboundPush = true
+	cfg.EnableCalendarSync = true
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.DisplayOrchestrator() == nil {
+		t.Fatalf("expected non-nil DisplayOrchestrator when both EnableOutboundPush and EnableCalendarSync are true")
+	}
+	if r.Server().DisplayProvider() != r.DisplayOrchestrator() {
+		t.Errorf("expected Server.DisplayProvider() to match Runner.DisplayOrchestrator()")
+	}
+}
+
+func TestNewRunner_WithDisplayOrchestrator_Option(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "valid-token"
+	cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+
+	orch := calendar.NewDisplayOrchestrator(calendar.OrchestratorConfig{
+		Enabled: true,
+	})
+
+	r, err := runner.NewRunner(cfg, runner.WithDisplayOrchestrator(orch))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.DisplayOrchestrator() != orch {
+		t.Errorf("expected custom DisplayOrchestrator to be set on Runner")
+	}
+	if r.Server().DisplayProvider() != orch {
+		t.Errorf("expected Server.DisplayProvider() to be set to custom DisplayOrchestrator")
+	}
+}
+
+func TestRunner_DisplayOrchestrator_LifecycleAndGracefulShutdown(t *testing.T) {
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(freeLn.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	_ = freeLn.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "token"
+	cfg.Port = port
+	cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+	cfg.EnableOutboundPush = true
+	cfg.EnableCalendarSync = true
+	cfg.CalendarPollInterval = 1 * time.Minute
+	cfg.ShutdownTimeout = 500 * time.Millisecond
+
+	mockPush := newMockPushClient(busybar.PushConfig{Enabled: true})
+
+	r, err := runner.NewRunner(cfg, runner.WithPushClient(mockPush))
+	if err != nil {
+		t.Fatalf("failed to create runner: %v", err)
+	}
+	if r.DisplayOrchestrator() == nil {
+		t.Fatalf("expected non-nil DisplayOrchestrator")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- r.Run(ctx)
+	}()
+
+	// DisplayOrchestrator should push an initial frame upon starting
+	select {
+	case frame := <-mockPush.pushedChan:
+		if frame == nil {
+			t.Errorf("expected non-nil frame pushed by DisplayOrchestrator")
+		}
+	case <-time.After(1 * time.Second):
+		t.Errorf("expected DisplayOrchestrator to push initial frame during Run()")
+	}
+
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("expected clean shutdown, got %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Run() did not finish within expected bounds")
+	}
+
+	// Verify DisplayOrchestrator was closed (Start should now return closed error)
+	if err := r.DisplayOrchestrator().Start(context.Background()); err == nil {
+		t.Errorf("expected DisplayOrchestrator to be closed after Run() shutdown")
+	}
+}
+
+func TestRunner_DisplayOrchestrator_CloseAndShutdown(t *testing.T) {
+	t.Run("Close closes DisplayOrchestrator", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.HassToken = "token"
+		cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+		cfg.EnableOutboundPush = true
+		cfg.EnableCalendarSync = true
+
+		r, err := runner.NewRunner(cfg)
+		if err != nil {
+			t.Fatalf("failed to create runner: %v", err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("expected Close() to succeed, got %v", err)
+		}
+		if err := r.DisplayOrchestrator().Start(context.Background()); err == nil {
+			t.Errorf("expected DisplayOrchestrator to be closed after r.Close()")
+		}
+	})
+
+	t.Run("Shutdown closes DisplayOrchestrator", func(t *testing.T) {
+		cfg := config.DefaultConfig()
+		cfg.HassToken = "token"
+		cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+		cfg.EnableOutboundPush = true
+		cfg.EnableCalendarSync = true
+
+		r, err := runner.NewRunner(cfg)
+		if err != nil {
+			t.Fatalf("failed to create runner: %v", err)
+		}
+		if err := r.Shutdown(context.Background()); err != nil {
+			t.Fatalf("expected Shutdown() to succeed, got %v", err)
+		}
+		if err := r.DisplayOrchestrator().Start(context.Background()); err == nil {
+			t.Errorf("expected DisplayOrchestrator to be closed after r.Shutdown()")
+		}
+	})
+}
+
+func TestRunner_DisplayOrchestrator_StartError(t *testing.T) {
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	_, portStr, _ := net.SplitHostPort(freeLn.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+	_ = freeLn.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.HassToken = "token"
+	cfg.Port = port
+	cfg.CalendarStorePath = filepath.Join(t.TempDir(), "calendar.pb")
+	cfg.EnableOutboundPush = true
+	cfg.EnableCalendarSync = true
+
+	r, err := runner.NewRunner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create runner: %v", err)
+	}
+
+	// Pre-close DisplayOrchestrator to force Start error on Run
+	_ = r.DisplayOrchestrator().Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = r.Run(ctx)
+	if err == nil {
+		t.Fatalf("expected error from Run() when DisplayOrchestrator fails to start, got nil")
+	}
+	if !strings.Contains(err.Error(), "display orchestrator") {
+		t.Errorf("expected error message to mention 'display orchestrator', got %v", err)
+	}
+}

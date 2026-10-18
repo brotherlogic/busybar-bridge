@@ -29,7 +29,8 @@ type Runner struct {
 	calendarStore *calendar.Store
 	calendarMgr   *calendar.Manager
 	calendarPoller *calendar.Poller
-	pushClient    busybar.PushClient
+	pushClient     busybar.PushClient
+	displayOrch    *calendar.DisplayOrchestrator
 
 	mu      sync.Mutex
 	running bool
@@ -103,6 +104,13 @@ func WithCalendarPoller(poller *calendar.Poller) Option {
 func WithPushClient(client busybar.PushClient) Option {
 	return func(r *Runner) {
 		r.pushClient = client
+	}
+}
+
+// WithDisplayOrchestrator overrides the calendar display orchestrator.
+func WithDisplayOrchestrator(orch *calendar.DisplayOrchestrator) Option {
+	return func(r *Runner) {
+		r.displayOrch = orch
 	}
 }
 
@@ -196,6 +204,14 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 		r.pushClient = busybar.NewPushClient(pushCfg, r.store)
 	}
 
+	if r.displayOrch == nil && cfg.EnableOutboundPush && cfg.EnableCalendarSync {
+		r.displayOrch = calendar.NewDisplayOrchestrator(calendar.OrchestratorConfig{
+			Enabled:    true,
+			Tracker:    r.calendarPoller,
+			PushClient: r.pushClient,
+		})
+	}
+
 	if r.server == nil {
 		serverCfg := server.DefaultConfig()
 		serverCfg.Port = cfg.Port
@@ -210,6 +226,9 @@ func NewRunner(cfg *config.AppConfig, opts ...Option) (*Runner, error) {
 		serverOpts = append(serverOpts, server.WithOAuthConfigured(cfg.IsOAuthConfigured()))
 		if r.calendarPoller != nil {
 			serverOpts = append(serverOpts, server.WithEventTracker(r.calendarPoller))
+		}
+		if r.displayOrch != nil {
+			serverOpts = append(serverOpts, server.WithDisplayProvider(r.displayOrch))
 		}
 
 		r.server = server.NewServer(serverCfg, r.store, serverOpts...)
@@ -271,6 +290,11 @@ func (r *Runner) PushClient() busybar.PushClient {
 // CalendarPoller returns the calendar poller, or nil if not configured.
 func (r *Runner) CalendarPoller() *calendar.Poller {
 	return r.calendarPoller
+}
+
+// DisplayOrchestrator returns the calendar display orchestrator, or nil if not configured.
+func (r *Runner) DisplayOrchestrator() *calendar.DisplayOrchestrator {
+	return r.displayOrch
 }
 
 // TranslateEvent converts a normalized Protobuf event into a typed Home Assistant Event.
@@ -433,6 +457,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 
+	// 6. Start display orchestrator
+	if r.displayOrch != nil {
+		if err := r.displayOrch.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start display orchestrator: %w", err)
+		}
+	}
+
 	// Periodically sync connection state from client to telemetry store
 	syncCtx, syncCancel := context.WithCancel(ctx)
 	defer syncCancel()
@@ -508,6 +539,13 @@ frameLoop:
 	defer shutdownCancel()
 
 	var shutdownWg sync.WaitGroup
+	if r.displayOrch != nil {
+		shutdownWg.Add(1)
+		go func() {
+			defer shutdownWg.Done()
+			_ = r.displayOrch.Close()
+		}()
+	}
 	if r.hassClient != nil {
 		shutdownWg.Add(1)
 		go func() {
@@ -558,6 +596,11 @@ func (r *Runner) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if r.displayOrch != nil {
+		if err := r.displayOrch.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if r.pushClient != nil {
 		if err := r.pushClient.Close(); err != nil {
 			errs = append(errs, err)
@@ -591,6 +634,18 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var errs []error
+
+	if r.displayOrch != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.displayOrch.Close(); err != nil {
+				errMu.Lock()
+				errs = append(errs, err)
+				errMu.Unlock()
+			}
+		}()
+	}
 
 	if r.pushClient != nil {
 		wg.Add(1)
