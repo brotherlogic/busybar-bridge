@@ -1319,8 +1319,226 @@ func TestStatusPageRendering_ActiveEventAndCalendarSync(t *testing.T) {
 	}
 }
 
+type mockDisplayProvider struct {
+	state calendar.DisplayState
+}
 
+func (m *mockDisplayProvider) GetDisplayState() calendar.DisplayState {
+	return m.state
+}
 
+func TestServerOptions_DisplayProvider(t *testing.T) {
+	store := telemetry.NewStore()
+	provider := &mockDisplayProvider{
+		state: calendar.DisplayState{
+			Mode:       calendar.DisplayModeBusy,
+			TopLine:    "Standup",
+			BottomLine: "00:10",
+		},
+	}
 
+	opts := ServerOptions{
+		DisplayProvider: provider,
+	}
+	srv := NewWithOptions(DefaultConfig(), store, opts)
+	if srv.DisplayProvider() != provider {
+		t.Errorf("expected DisplayProvider to match provided provider via ServerOptions")
+	}
+
+	srv2 := New(DefaultConfig(), store, WithDisplayProvider(provider))
+	if srv2.DisplayProvider() != provider {
+		t.Errorf("expected DisplayProvider to match provided provider via WithDisplayProvider")
+	}
+}
+
+func TestStatusJSON_DisplayState_ProviderAndFallback(t *testing.T) {
+	store := telemetry.NewStore()
+
+	t.Run("with_display_provider", func(t *testing.T) {
+		provider := &mockDisplayProvider{
+			state: calendar.DisplayState{
+				Mode:       calendar.DisplayModeBusy,
+				TopLine:    "Design Sync",
+				BottomLine: "00:25",
+			},
+		}
+		srv := New(DefaultConfig(), store, WithDisplayProvider(provider))
+
+		for _, tc := range []struct {
+			name   string
+			path   string
+			accept string
+		}{
+			{name: "query_format_status", path: "/status?format=json"},
+			{name: "query_format_root", path: "/?format=json"},
+			{name: "accept_header_status", path: "/status", accept: "application/json"},
+			{name: "accept_header_root", path: "/", accept: "application/json"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+				if tc.accept != "" {
+					req.Header.Set("Accept", tc.accept)
+				}
+				rec := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusOK {
+					t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+				}
+
+				var data StatusData
+				if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+					t.Fatalf("failed to decode JSON response: %v", err)
+				}
+				if data.DisplayState.Mode != calendar.DisplayModeBusy {
+					t.Errorf("expected DisplayState.Mode=%q, got %q", calendar.DisplayModeBusy, data.DisplayState.Mode)
+				}
+				if data.DisplayState.TopLine != "Design Sync" {
+					t.Errorf("expected DisplayState.TopLine='Design Sync', got %q", data.DisplayState.TopLine)
+				}
+				if data.DisplayState.BottomLine != "00:25" {
+					t.Errorf("expected DisplayState.BottomLine='00:25', got %q", data.DisplayState.BottomLine)
+				}
+
+				var raw map[string]interface{}
+				if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+					t.Fatalf("failed to unmarshal raw map: %v", err)
+				}
+				dsRaw, exists := raw["display_state"]
+				if !exists || dsRaw == nil {
+					t.Fatalf("expected display_state object in raw JSON payload, got keys: %v", raw)
+				}
+				dsMap, ok := dsRaw.(map[string]interface{})
+				if !ok {
+					t.Fatalf("expected display_state to be a map, got %T", dsRaw)
+				}
+				if mode, _ := dsMap["mode"].(string); mode != "busy" {
+					t.Errorf("expected raw display_state.mode='busy', got %v", dsMap["mode"])
+				}
+				if topLine, _ := dsMap["top_line"].(string); topLine != "Design Sync" {
+					t.Errorf("expected raw display_state.top_line='Design Sync', got %v", dsMap["top_line"])
+				}
+				if bottomLine, _ := dsMap["bottom_line"].(string); bottomLine != "00:25" {
+					t.Errorf("expected raw display_state.bottom_line='00:25', got %v", dsMap["bottom_line"])
+				}
+			})
+		}
+	})
+
+	t.Run("fallback_active_event", func(t *testing.T) {
+		tracker := &mockEventTracker{
+			event: calendar.ActiveEvent{
+				Summary:   "Long Architecture Review Session",
+				Countdown: "01:30",
+				Idle:      false,
+			},
+		}
+		srv := New(DefaultConfig(), store, WithEventTracker(tracker))
+
+		req := httptest.NewRequest(http.MethodGet, "/status?format=json", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+		}
+
+		var data StatusData
+		if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+			t.Fatalf("failed to decode JSON response: %v", err)
+		}
+		if data.DisplayState.Mode != calendar.DisplayModeBusy {
+			t.Errorf("expected DisplayState.Mode=%q, got %q", calendar.DisplayModeBusy, data.DisplayState.Mode)
+		}
+		if data.DisplayState.TopLine != "Long Architect" {
+			t.Errorf("expected truncated DisplayState.TopLine='Long Architect', got %q", data.DisplayState.TopLine)
+		}
+		if data.DisplayState.BottomLine != "01:30" {
+			t.Errorf("expected DisplayState.BottomLine='01:30', got %q", data.DisplayState.BottomLine)
+		}
+	})
+
+	t.Run("fallback_idle", func(t *testing.T) {
+		srv := New(DefaultConfig(), store)
+
+		req := httptest.NewRequest(http.MethodGet, "/status?format=json", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+		}
+
+		var data StatusData
+		if err := json.Unmarshal(rec.Body.Bytes(), &data); err != nil {
+			t.Fatalf("failed to decode JSON response: %v", err)
+		}
+		if data.DisplayState.Mode != calendar.DisplayModeIdle {
+			t.Errorf("expected DisplayState.Mode=%q, got %q", calendar.DisplayModeIdle, data.DisplayState.Mode)
+		}
+		if data.DisplayState.TopLine == "" {
+			t.Errorf("expected non-empty idle DisplayState.TopLine")
+		}
+		if data.DisplayState.BottomLine == "" {
+			t.Errorf("expected non-empty idle DisplayState.BottomLine")
+		}
+	})
+}
+
+func TestStatusPageRendering_DisplayState(t *testing.T) {
+	store := telemetry.NewStore()
+
+	t.Run("active_meeting_display_preview", func(t *testing.T) {
+		provider := &mockDisplayProvider{
+			state: calendar.DisplayState{
+				Mode:       calendar.DisplayModeBusy,
+				TopLine:    "Product Review",
+				BottomLine: "00:35",
+			},
+		}
+		srv := New(DefaultConfig(), store, WithDisplayProvider(provider))
+
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "Product Review") {
+			t.Errorf("expected rendered HTML to contain DisplayState.TopLine 'Product Review'")
+		}
+		if !strings.Contains(body, "00:35") {
+			t.Errorf("expected rendered HTML to contain DisplayState.BottomLine '00:35'")
+		}
+	})
+
+	t.Run("idle_display_preview", func(t *testing.T) {
+		provider := &mockDisplayProvider{
+			state: calendar.DisplayState{
+				Mode:       calendar.DisplayModeIdle,
+				TopLine:    "Sun Oct 18",
+				BottomLine: "10:15",
+			},
+		}
+		srv := New(DefaultConfig(), store, WithDisplayProvider(provider))
+
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "Sun Oct 18") {
+			t.Errorf("expected rendered HTML to contain idle DisplayState.TopLine 'Sun Oct 18'")
+		}
+		if !strings.Contains(body, "10:15") {
+			t.Errorf("expected rendered HTML to contain idle DisplayState.BottomLine '10:15'")
+		}
+	})
+}
 
 

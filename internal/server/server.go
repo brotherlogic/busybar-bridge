@@ -53,8 +53,9 @@ type CalendarStatus struct {
 // StatusData encapsulates the telemetry snapshot and calendar status for dashboard rendering.
 type StatusData struct {
 	telemetry.Snapshot
-	Calendar    CalendarStatus       `json:"calendar"`
-	ActiveEvent calendar.ActiveEvent `json:"active_event"`
+	Calendar     CalendarStatus        `json:"calendar"`
+	ActiveEvent  calendar.ActiveEvent  `json:"active_event"`
+	DisplayState calendar.DisplayState `json:"display_state"`
 }
 
 // Config defines the HTTP server configuration parameters.
@@ -80,6 +81,7 @@ type ServerOptions struct {
 	CalendarManager OAuthManager
 	OAuthConfigured *bool
 	EventTracker    calendar.EventTracker
+	DisplayProvider calendar.DisplayProvider
 }
 
 // ServerOption represents a functional option for configuring a Server.
@@ -101,6 +103,9 @@ func WithServerOptions(opts ServerOptions) ServerOption {
 		}
 		if opts.EventTracker != nil {
 			s.eventTracker = opts.EventTracker
+		}
+		if opts.DisplayProvider != nil {
+			s.displayProvider = opts.DisplayProvider
 		}
 	}
 }
@@ -138,6 +143,13 @@ func WithEventTracker(tracker calendar.EventTracker) ServerOption {
 	}
 }
 
+// WithDisplayProvider configures the calendar.DisplayProvider for the server.
+func WithDisplayProvider(provider calendar.DisplayProvider) ServerOption {
+	return func(s *Server) {
+		s.displayProvider = provider
+	}
+}
+
 // Server provides HTTP lifecycle management, observability probe endpoints,
 // and Google Calendar OAuth linking endpoints.
 type Server struct {
@@ -147,6 +159,7 @@ type Server struct {
 	oauthMgr        OAuthManager
 	oauthConfigured *bool
 	eventTracker    calendar.EventTracker
+	displayProvider calendar.DisplayProvider
 	httpServer      *http.Server
 	listener        net.Listener
 	tmpl            *template.Template
@@ -244,6 +257,11 @@ func (s *Server) CalendarManager() OAuthManager {
 // EventTracker returns the configured EventTracker dependency.
 func (s *Server) EventTracker() calendar.EventTracker {
 	return s.eventTracker
+}
+
+// DisplayProvider returns the configured DisplayProvider dependency.
+func (s *Server) DisplayProvider() calendar.DisplayProvider {
+	return s.displayProvider
 }
 
 // HTTPServer returns the internal http.Server instance.
@@ -411,10 +429,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		activeEvent = s.eventTracker.GetCurrentEvent()
 	}
 
+	var displayState calendar.DisplayState
+	if s.displayProvider != nil {
+		displayState = s.displayProvider.GetDisplayState()
+	} else {
+		displayState = calendar.FormatDisplayState(activeEvent, time.Now())
+	}
+
 	data := StatusData{
-		Snapshot:    snapshot,
-		Calendar:    s.calendarStatus(r),
-		ActiveEvent: activeEvent,
+		Snapshot:     snapshot,
+		Calendar:     s.calendarStatus(r),
+		ActiveEvent:  activeEvent,
+		DisplayState: displayState,
 	}
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") || r.URL.Query().Get("format") == "json" {
