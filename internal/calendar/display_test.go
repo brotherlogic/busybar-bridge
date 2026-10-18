@@ -2,7 +2,10 @@ package calendar
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -266,3 +269,310 @@ func TestRenderFrame_MultiDayCountdownsAndLongUTF8(t *testing.T) {
 		t.Fatalf("oversized frame len(Data) = %d, want %d", len(oversizedFrame.GetData()), DisplayBufferSize)
 	}
 }
+
+type mockEventTracker struct {
+	mu sync.RWMutex
+	ev ActiveEvent
+}
+
+func (m *mockEventTracker) GetCurrentEvent() ActiveEvent {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ev
+}
+
+func (m *mockEventTracker) SetEvent(ev ActiveEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ev = ev
+}
+
+type mockPushClient struct {
+	mu      sync.Mutex
+	frames  []*busybar.Frame
+	pushErr error
+	pushCh  chan *busybar.Frame
+}
+
+func newMockPushClient() *mockPushClient {
+	return &mockPushClient{
+		pushCh: make(chan *busybar.Frame, 32),
+	}
+}
+
+func (m *mockPushClient) PushFrame(_ context.Context, frame *busybar.Frame) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pushErr != nil {
+		return m.pushErr
+	}
+	m.frames = append(m.frames, frame)
+	select {
+	case m.pushCh <- frame:
+	default:
+	}
+	return nil
+}
+
+func (m *mockPushClient) Start(_ context.Context) error { return nil }
+func (m *mockPushClient) Close() error                  { return nil }
+func (m *mockPushClient) Config() busybar.PushConfig    { return busybar.DefaultPushConfig() }
+
+func (m *mockPushClient) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.frames)
+}
+
+func (m *mockPushClient) LastFrame() *busybar.Frame {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.frames) == 0 {
+		return nil
+	}
+	return m.frames[len(m.frames)-1]
+}
+
+func (m *mockPushClient) SetError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pushErr = err
+}
+
+func TestDisplayOrchestrator_ImmediateChangeDetectionAndBackToBack(t *testing.T) {
+	ctx := context.Background()
+	var clockMu sync.Mutex
+	now := time.Date(2026, time.October, 18, 10, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	tracker := &mockEventTracker{
+		ev: ActiveEvent{
+			Summary:   "Sprint Review",
+			StartTime: now.Add(-30 * time.Minute),
+			EndTime:   now.Add(30 * time.Minute),
+			Countdown: "00:30",
+			Idle:      false,
+		},
+	}
+	pushClient := newMockPushClient()
+
+	orch := NewDisplayOrchestrator(OrchestratorConfig{
+		Enabled:           true,
+		Tracker:           tracker,
+		PushClient:        pushClient,
+		EvalInterval:      1 * time.Second,
+		KeepAliveInterval: 30 * time.Second,
+		Now:               nowFn,
+	})
+
+	// Before first Step, GetDisplayState should compute on-the-fly from Tracker
+	initialState := orch.GetDisplayState()
+	if initialState.Mode != DisplayModeBusy || initialState.TopLine != "Sprint Review" || initialState.BottomLine != "00:30" {
+		t.Fatalf("unexpected pre-step DisplayState: %+v", initialState)
+	}
+
+	// 1. Immediate push on first Step
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("first Step error: %v", err)
+	}
+	if got := pushClient.Count(); got != 1 {
+		t.Fatalf("push count after first Step = %d, want 1", got)
+	}
+
+	// 2. Duplicate push suppressed when state is unchanged within < 30s
+	advanceClock(10 * time.Second)
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("second Step error: %v", err)
+	}
+	if got := pushClient.Count(); got != 1 {
+		t.Fatalf("push count after unchanged Step within <30s = %d, want 1", got)
+	}
+
+	// 3. Immediate push on minute rollover
+	advanceClock(50 * time.Second)
+	tracker.SetEvent(ActiveEvent{
+		Summary:   "Sprint Review",
+		StartTime: nowFn().Add(-31 * time.Minute),
+		EndTime:   nowFn().Add(29 * time.Minute),
+		Countdown: "00:29",
+		Idle:      false,
+	})
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("minute rollover Step error: %v", err)
+	}
+	if got := pushClient.Count(); got != 2 {
+		t.Fatalf("push count after minute rollover = %d, want 2", got)
+	}
+	if st := orch.GetDisplayState(); st.BottomLine != "00:29" {
+		t.Errorf("GetDisplayState().BottomLine = %q, want %q", st.BottomLine, "00:29")
+	}
+
+	// 4. Back-to-back meeting transition without flashing idle
+	advanceClock(5 * time.Second)
+	tracker.SetEvent(ActiveEvent{
+		Summary:   "Design Sync",
+		StartTime: nowFn(),
+		EndTime:   nowFn().Add(60 * time.Minute),
+		Countdown: "01:00",
+		Idle:      false,
+	})
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("back-to-back transition Step error: %v", err)
+	}
+	if got := pushClient.Count(); got != 3 {
+		t.Fatalf("push count after back-to-back transition = %d, want 3", got)
+	}
+	if st := orch.GetDisplayState(); st.Mode != DisplayModeBusy || st.TopLine != "Design Sync" || st.BottomLine != "01:00" {
+		t.Errorf("unexpected state after back-to-back meeting: %+v", st)
+	}
+
+	// 5. Immediate transition to idle when meeting ends
+	advanceClock(5 * time.Second)
+	tracker.SetEvent(ActiveEvent{Idle: true})
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("idle transition Step error: %v", err)
+	}
+	if got := pushClient.Count(); got != 4 {
+		t.Fatalf("push count after idle transition = %d, want 4", got)
+	}
+	if st := orch.GetDisplayState(); st.Mode != DisplayModeIdle {
+		t.Errorf("expected idle mode after meeting ended, got %+v", st)
+	}
+}
+
+func TestDisplayOrchestrator_KeepAliveRefresh(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC)
+
+	tracker := &mockEventTracker{
+		ev: ActiveEvent{
+			Summary:   "Deep Work",
+			Countdown: "01:00",
+			Idle:      false,
+		},
+	}
+	pushClient := newMockPushClient()
+
+	orch := NewDisplayOrchestrator(OrchestratorConfig{
+		Enabled:           true,
+		Tracker:           tracker,
+		PushClient:        pushClient,
+		EvalInterval:      1 * time.Second,
+		KeepAliveInterval: 30 * time.Second,
+		Now:               func() time.Time { return now },
+	})
+
+	// Initial push at t=0
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("initial Step error: %v", err)
+	}
+	if got := pushClient.Count(); got != 1 {
+		t.Fatalf("push count at t=0 = %d, want 1", got)
+	}
+
+	// At t=29s, state unchanged -> no push
+	now = now.Add(29 * time.Second)
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("Step at t=29s error: %v", err)
+	}
+	if got := pushClient.Count(); got != 1 {
+		t.Fatalf("push count at t=29s = %d, want 1", got)
+	}
+
+	// At t=30s, state unchanged -> keep-alive push triggered
+	now = now.Add(1 * time.Second)
+	if err := orch.Step(ctx); err != nil {
+		t.Fatalf("Step at t=30s error: %v", err)
+	}
+	if got := pushClient.Count(); got != 2 {
+		t.Fatalf("push count at t=30s = %d, want 2", got)
+	}
+}
+
+func TestDisplayOrchestrator_PushErrorResilienceAndLifecycle(t *testing.T) {
+	ctx := context.Background()
+
+	// Disabled orchestrator is a no-op
+	disabledOrch := NewDisplayOrchestrator(OrchestratorConfig{Enabled: false})
+	if err := disabledOrch.Step(ctx); err != nil {
+		t.Fatalf("disabled Step error: %v", err)
+	}
+	if st := disabledOrch.GetDisplayState(); st.Mode != DisplayModeIdle {
+		t.Errorf("disabled GetDisplayState().Mode = %q, want %q", st.Mode, DisplayModeIdle)
+	}
+
+	var clockMu sync.Mutex
+	now := time.Date(2026, time.October, 18, 15, 0, 0, 0, time.UTC)
+	tracker := &mockEventTracker{
+		ev: ActiveEvent{
+			Summary:   "Incident Response",
+			Countdown: "00:45",
+			Idle:      false,
+		},
+	}
+	pushClient := newMockPushClient()
+	pushClient.SetError(errors.New("device unreachable"))
+
+	orch := NewDisplayOrchestrator(OrchestratorConfig{
+		Enabled:           true,
+		Tracker:           tracker,
+		PushClient:        pushClient,
+		EvalInterval:      10 * time.Millisecond,
+		KeepAliveInterval: 30 * time.Second,
+		Now: func() time.Time {
+			clockMu.Lock()
+			defer clockMu.Unlock()
+			return now
+		},
+	})
+
+	// Step returns error when PushFrame fails, and does not mark hasPushed so next tick retries
+	if err := orch.Step(ctx); err == nil {
+		t.Fatal("expected Step to return PushFrame error")
+	}
+	if got := pushClient.Count(); got != 0 {
+		t.Fatalf("push count on error = %d, want 0", got)
+	}
+
+	// Clear error and Start background worker
+	pushClient.SetError(nil)
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := orch.Start(runCtx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	// Double-start must return an error
+	if err := orch.Start(runCtx); err == nil {
+		t.Fatal("expected error on second Start call")
+	}
+
+	select {
+	case <-pushClient.pushCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial startup push from Start()")
+	}
+
+	// Close idempotently and verify clean goroutine termination
+	if err := orch.Close(); err != nil {
+		t.Fatalf("first Close error: %v", err)
+	}
+	if err := orch.Close(); err != nil {
+		t.Fatalf("second Close error: %v", err)
+	}
+
+	// Start after Close must return an error
+	if err := orch.Start(context.Background()); err == nil {
+		t.Fatal("expected error when starting closed orchestrator")
+	}
+}
+
